@@ -1,6 +1,6 @@
 import Foundation
 
-public let kWhisperrSdkVersion = "0.2.0"
+public let kWhisperrSdkVersion = "0.2.1"
 public let kWhisperrDefaultBaseURL = URL(string: "https://api.whisperr.net")!
 
 private let eventTypePattern = try! NSRegularExpression(
@@ -24,8 +24,11 @@ public actor WhisperrClient {
     /// so both survive an app restart.
     private var lastPushToken: String?
     private var lastPushUserID: String?
-    private var started = false
     private var closed = false
+    /// The one-time restore, shared so every entrant (start / flush /
+    /// identify / setPushToken via ensureUsable) awaits the SAME in-flight
+    /// restore instead of racing past a `started` flag before state is loaded.
+    private var restoreTask: Task<Void, Never>?
     private var flushLoop: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
 
@@ -73,12 +76,19 @@ public actor WhisperrClient {
     }
 
     public func start() async {
-        guard !started else {
+        // All entrants await the SAME restore. A second caller arriving while
+        // restore is in flight (e.g. the APNs setPushToken callback racing the
+        // launch's start()) blocks here until state is loaded, instead of
+        // sailing past a `started` flag and reading currentUserID == nil.
+        if let restoreTask {
+            await restoreTask.value
             return
         }
-        started = true
-        await restore()
-        if options.flushInterval > 0 {
+        let task = Task { await self.restore() }
+        restoreTask = task
+        await task.value
+        // Start the periodic flusher once, after restore has completed.
+        if flushLoop == nil, options.flushInterval > 0 {
             let interval = options.flushInterval
             flushLoop = Task { [weak self, sleeper] in
                 while !Task.isCancelled {
@@ -140,6 +150,16 @@ public actor WhisperrClient {
            !(lastPushUserID == id && lastPushToken == pending) {
             resolvedChannels.append(.push(pending, optedIn: true))
         }
+        // Rotation: if this identify registers a push token that differs from
+        // the last one we sent for this user, opt the old one out in the same
+        // body — exactly like setPushToken — so a token passed via pushToken:
+        // (or an explicit push channel) isn't stranded opted-in.
+        if let newPush = resolvedChannels.last(where: { $0.type == .push && $0.optedIn != false }),
+           let last = (lastPushUserID == id) ? lastPushToken : nil,
+           last != newPush.address,
+           !resolvedChannels.contains(where: { $0.type == .push && $0.address == last }) {
+            resolvedChannels.insert(.push(last, optedIn: false), at: 0)
+        }
         rememberPushChannel(userID: id, channels: resolvedChannels)
         pendingPushToken = nil
         if !resolvedChannels.isEmpty {
@@ -163,8 +183,12 @@ public actor WhisperrClient {
     public func setPushToken(_ token: String) async throws {
         try await ensureUsable()
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An empty / whitespace token is silently ignored: getToken() can return
+        // an empty string before the device has registered, and this is safe to
+        // call on every launch, so it must be a no-op (not an error). Matches the
+        // React Native and Flutter SDKs.
         guard !trimmed.isEmpty else {
-            throw WhisperrClientError.emptyPushToken
+            return
         }
         guard let userID = currentUserID else {
             pendingPushToken = trimmed // attached to the next identify()
@@ -290,6 +314,7 @@ public actor WhisperrClient {
                     message: "dropped \(batch.count) operation(s) - rejected by server",
                     status: status
                 ))
+                await forgetPushMark(batch) // registration rejected — let it re-send
                 await persist()
             case .auth(let status):
                 queue.insert(contentsOf: batch, at: 0)
@@ -320,7 +345,9 @@ public actor WhisperrClient {
         queue.append(op)
         if queue.count > options.maxQueueSize {
             let overflow = queue.count - options.maxQueueSize
+            let evicted = Array(queue.prefix(overflow))
             queue.removeFirst(overflow)
+            await forgetPushMark(evicted) // an evicted registration never shipped
             emit(.init(
                 type: .dropped,
                 message: "queue exceeded \(options.maxQueueSize); dropped \(overflow) oldest operation(s)"
@@ -383,19 +410,32 @@ public actor WhisperrClient {
         guard let data = await persistence?.load(), !data.isEmpty else {
             return
         }
-        if let state = try? JSONDecoder.whisperr.decode(PersistedState.self, from: data) {
-            queue = state.queue
-            currentUserID = state.userID
-            lastPushUserID = state.lastPushUserID
-            lastPushToken = state.lastPushToken
+        var state: PersistedState?
+        if let decoded = try? JSONDecoder.whisperr.decode(PersistedState.self, from: data) {
+            state = decoded
+        } else if let legacyQueue = try? JSONDecoder.whisperr.decode([QueuedOperation].self, from: data) {
+            // Data written by 0.1.x was the bare queue array.
+            state = PersistedState(queue: legacyQueue)
+        } else {
+            log("failed to restore persisted state")
+            state = nil
+        }
+        guard let state else {
             return
         }
-        do {
-            // Data written by 0.1.x was the bare queue array.
-            queue = try JSONDecoder.whisperr.decode([QueuedOperation].self, from: data)
-        } catch {
-            log("failed to restore persisted state: \(error)")
-            queue = []
+        // Load persisted state without overwriting anything a caller mutated
+        // after start() began (e.g. an identify() or setPushToken() that ran
+        // while this restore's `await load()` was suspended): restore only the
+        // fields still at their fresh-launch defaults, so a live value wins.
+        if queue.isEmpty {
+            queue = state.queue
+        }
+        if currentUserID == nil {
+            currentUserID = state.userID
+        }
+        if lastPushUserID == nil, lastPushToken == nil {
+            lastPushUserID = state.lastPushUserID
+            lastPushToken = state.lastPushToken
         }
     }
 
@@ -442,6 +482,37 @@ public actor WhisperrClient {
         for channel in channels where channel.type == .push && channel.optedIn != false {
             lastPushUserID = userID
             lastPushToken = channel.address
+        }
+    }
+
+    /// A dropped (4xx) or overflow-evicted op never reached the server, so the
+    /// (user, token) pair it would have registered must not stay marked as
+    /// delivered — otherwise a single rejection wedges that token opted-out of
+    /// every future setPushToken. Clears the mark when a discarded op carried it.
+    private func forgetPushMark(_ discarded: [QueuedOperation]) async {
+        guard let token = lastPushToken, let user = lastPushUserID else {
+            return
+        }
+        for op in discarded where op.kind == .identify {
+            guard op.body["external_user_id"] == .string(user),
+                  case .array(let channels)? = op.body["channels"] else {
+                continue
+            }
+            let carried = channels.contains { channel in
+                guard case .object(let fields) = channel else {
+                    return false
+                }
+                let optedIn = fields["opted_in"]
+                return fields["channel"] == .string("push")
+                    && fields["address"] == .string(token)
+                    && (optedIn == nil || optedIn == .bool(true))
+            }
+            if carried {
+                lastPushUserID = nil
+                lastPushToken = nil
+                await persist()
+                return
+            }
         }
     }
 

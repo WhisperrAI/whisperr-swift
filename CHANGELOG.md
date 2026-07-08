@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: the in-flight restore is now awaited by every entrant. `start()` set a
+  `started` flag *before* `await restore()`, so a `setPushToken` racing the
+  launch (e.g. from the APNs registration callback) sailed past the flag,
+  observed `currentUserID == nil`, and silently buffered a token that was never
+  sent for an already-identified returning user; an `identify()` racing restore
+  could also be clobbered when the persisted state loaded. Entrants now await
+  the same restore task, and restore no longer overwrites state mutated after
+  `start()` began.
+- Fix: `setPushToken("")` / whitespace-only tokens are silently ignored instead
+  of throwing `WhisperrClientError.emptyPushToken` — `getToken()` can return an
+  empty string before the device registers, and the method is documented as
+  safe to call on every launch. Aligns Swift with the React Native and Flutter
+  SDKs. (The `emptyPushToken` case is retained for source compatibility but is
+  no longer thrown.)
+- Fix: the dedup pair is a mark of what was **delivered**. A registration whose
+  request is dropped (non-retryable `4xx`) or evicted on queue overflow now
+  clears the pair, so the token re-registers next time instead of being wedged
+  opted-out forever by a single rejection.
+- `identify(pushToken:)` (or an explicit push channel on identify) now rotates
+  like `setPushToken`: a differing token opts the previous one out in the same
+  body instead of stranding it opted-in.
+- Verified against the hardened `whisperr-spec` `conformance/push.json` (reset,
+  empty-token, `identify(pushToken:)`, and restart-then-reidentify cases), plus
+  new unit tests for the restore race and the drop-clears-mark behavior.
+
 ## 0.2.0
 
 - `setPushToken(_:)`: first-class push-token capture. Re-identifies the `push`
