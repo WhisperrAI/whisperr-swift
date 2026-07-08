@@ -83,9 +83,10 @@ func application(
   `identify()`.
 - **Token rotation** is handled: the previously sent token is opted out and
   the new one opted in, so stale tokens don't accumulate — and tokens from the
-  user's other devices are never touched.
-- Setting the **same token twice** is a no-op, so it's safe to call on every
-  launch.
+  user's other devices are never touched. The last-sent pair is persisted, so
+  a rotation that happens after an app relaunch still retires the old token.
+- Setting the **same token twice** is a no-op — including across app
+  restarts — so it's safe to call on every launch or token refresh.
 - After `reset()` (logout), call `setPushToken` again once the next user logs
   in.
 
@@ -131,8 +132,9 @@ let whisperr = WhisperrClient(
 )
 ```
 
-The default queue persistence uses `UserDefaults`. For tests or ephemeral
-runtimes, pass `InMemoryWhisperrPersistence()`.
+The default persistence uses `UserDefaults` and stores the pending queue, the
+identified user, and the last-sent push token pair so all three survive app
+restarts. For tests or ephemeral runtimes, pass `InMemoryWhisperrPersistence()`.
 
 ## Development
 

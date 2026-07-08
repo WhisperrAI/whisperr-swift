@@ -2,8 +2,8 @@ import XCTest
 @testable import Whisperr
 
 /// Executes the push-token capture flows pinned in whisperr-spec
-/// conformance/push.json: partial re-identify, rotation opt-out, dedup, and
-/// buffer-until-identify.
+/// conformance/push.json: partial re-identify, rotation opt-out, dedup
+/// (including across restarts), and buffer-until-identify.
 final class PushConformanceTests: XCTestCase {
     func testPushTokenFlowsMatchSpec() async throws {
         let spec: PushSpec = try loadSpec(
@@ -14,7 +14,8 @@ final class PushConformanceTests: XCTestCase {
 
         for testCase in spec.cases {
             let transport = MockTransport()
-            let client = makeClient(transport: transport)
+            let persistence = InMemoryWhisperrPersistence()
+            var client = makeClient(transport: transport, persistence: persistence)
 
             for step in testCase.steps {
                 if let identify = step.identify {
@@ -29,6 +30,12 @@ final class PushConformanceTests: XCTestCase {
                     try await client.identify(userID, traits: traits)
                 } else if let token = step.setPushToken {
                     try await client.setPushToken(token)
+                } else if step.restart == true {
+                    // App relaunch: tear down the client and build a fresh one
+                    // sharing the same persistence; identity and last-sent
+                    // token must be restored from it.
+                    await client.close()
+                    client = makeClient(transport: transport, persistence: persistence)
                 } else {
                     XCTFail("\(testCase.name): unknown step")
                 }

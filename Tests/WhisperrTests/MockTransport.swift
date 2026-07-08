@@ -31,6 +31,7 @@ actor MockTransport: WhisperrTransport {
 func makeClient(
     transport: MockTransport,
     maxRetries: Int = 2,
+    persistence: WhisperrPersistence? = nil,
     clock: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_780_229_600) },
     onError: (@Sendable (WhisperrError) -> Void)? = nil
 ) -> WhisperrClient {
@@ -47,7 +48,7 @@ func makeClient(
             enablePersistence: true,
             onError: onError
         ),
-        persistence: InMemoryWhisperrPersistence(),
+        persistence: persistence ?? InMemoryWhisperrPersistence(),
         transport: transport,
         clock: clock,
         idGenerator: { ids.next() },
