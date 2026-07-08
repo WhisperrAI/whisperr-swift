@@ -17,6 +17,12 @@ public actor WhisperrClient {
 
     private var queue: [QueuedOperation] = []
     private var currentUserID: String?
+    /// Token captured before identify(); attached to the next identify.
+    private var pendingPushToken: String?
+    /// Last push token delivered and for which user — dedups refresh storms and
+    /// lets a rotation opt the previous token out.
+    private var lastPushToken: String?
+    private var lastPushUserID: String?
     private var started = false
     private var closed = false
     private var flushLoop: Task<Void, Never>?
@@ -118,12 +124,20 @@ public actor WhisperrClient {
             body["preferred_channel"] = .string(preferredChannel.rawValue)
         }
 
-        let resolvedChannels = buildChannels(
+        var resolvedChannels = buildChannels(
             email: email,
             phone: phone,
             pushToken: pushToken,
             explicit: channels
         )
+        // A token buffered by setPushToken() rides along unless the caller
+        // supplied its own push channel.
+        if let pending = pendingPushToken,
+           !resolvedChannels.contains(where: { $0.type == .push }) {
+            resolvedChannels.append(.push(pending, optedIn: true))
+        }
+        rememberPushChannel(userID: id, channels: resolvedChannels)
+        pendingPushToken = nil
         if !resolvedChannels.isEmpty {
             body["channels"] = .array(resolvedChannels.map { .object($0.body) })
         }
@@ -133,6 +147,54 @@ public actor WhisperrClient {
             kind: .identify,
             body: body
         ))
+    }
+
+    /// Captures the device push token (FCM registration token / hex APNs token).
+    ///
+    /// With a known user this re-identifies the push channel immediately: a
+    /// rotated token opts the previously sent one out, and setting the same
+    /// token again is a no-op (safe to call on every launch or token refresh).
+    /// Called before `identify`, the token is buffered in memory and attached
+    /// to the next identify.
+    public func setPushToken(_ token: String) async throws {
+        try await ensureUsable()
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw WhisperrClientError.emptyPushToken
+        }
+        guard let userID = currentUserID else {
+            pendingPushToken = trimmed // attached to the next identify()
+            return
+        }
+        let last = lastPushUserID == userID ? lastPushToken : nil
+        if last == trimmed {
+            return // refresh storm — token unchanged
+        }
+        var channels: [WhisperrChannel] = []
+        // Rotation: retire the token this client previously registered.
+        if let last {
+            channels.append(.push(last, optedIn: false))
+        }
+        channels.append(.push(trimmed, optedIn: true))
+        let body: [String: JSONValue] = [
+            "external_user_id": .string(userID),
+            "channels": .array(channels.map { .object($0.body) })
+        ]
+        lastPushUserID = userID
+        lastPushToken = trimmed
+        pendingPushToken = nil
+        await enqueue(QueuedOperation(
+            id: idGenerator(),
+            kind: .identify,
+            body: body
+        ))
+    }
+
+    /// APNs convenience: hex-encodes the `deviceToken` from
+    /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` and
+    /// forwards it to `setPushToken(_:)`.
+    public func setPushToken(deviceToken: Data) async throws {
+        try await setPushToken(deviceToken.map { String(format: "%02x", $0) }.joined())
     }
 
     /// Tracks a product event for the current user, or for `userID` when supplied.
@@ -185,6 +247,9 @@ public actor WhisperrClient {
     public func reset() async {
         await flush()
         currentUserID = nil
+        pendingPushToken = nil
+        lastPushToken = nil
+        lastPushUserID = nil
     }
 
     /// Drains the current queue until it is empty or delivery must pause.
@@ -350,6 +415,14 @@ public actor WhisperrClient {
         }
         out.append(contentsOf: explicit)
         return out
+    }
+
+    /// Records the opted-in push channel (if any) that an identify just sent.
+    private func rememberPushChannel(userID: String, channels: [WhisperrChannel]) {
+        for channel in channels where channel.type == .push && channel.optedIn != false {
+            lastPushUserID = userID
+            lastPushToken = channel.address
+        }
     }
 
     private func trimmedNonEmpty(_ input: String?) -> String? {

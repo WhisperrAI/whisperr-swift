@@ -88,6 +88,7 @@ public enum WhisperrClientError: Error, Equatable, Sendable {
     case emptyExternalUserID
     case missingUserID
     case emptyEventType
+    case emptyPushToken
     case closed
 }
 
