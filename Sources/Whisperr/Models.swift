@@ -88,6 +88,7 @@ public enum WhisperrClientError: Error, Equatable, Sendable {
     case emptyExternalUserID
     case missingUserID
     case emptyEventType
+    case emptyPushToken
     case closed
 }
 
@@ -140,6 +141,27 @@ struct QueuedOperation: Codable, Equatable, Sendable {
     let id: String
     let kind: QueuedOperationKind
     let body: [String: JSONValue]
+}
+
+/// Everything the client persists between launches: the pending queue, the
+/// identified user, and the last (user, token) pair delivered by push-token
+/// capture — so same-token dedupe and rotation opt-out survive app restarts.
+struct PersistedState: Codable, Equatable, Sendable {
+    var queue: [QueuedOperation] = []
+    var userID: String?
+    var lastPushUserID: String?
+    var lastPushToken: String?
+
+    var isEmpty: Bool {
+        queue.isEmpty && userID == nil && lastPushUserID == nil && lastPushToken == nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case queue
+        case userID = "user_id"
+        case lastPushUserID = "last_push_user_id"
+        case lastPushToken = "last_push_token"
+    }
 }
 
 public enum WhisperrSendResult: Sendable {

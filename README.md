@@ -9,7 +9,7 @@ stable event idempotency.
 Add the package in Xcode or Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.1.0")
+.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.2.0")
 ```
 
 ## Quick Start
@@ -60,6 +60,36 @@ Shortcut `email`, `phone`, and `pushToken` values expand to opted-in channels.
 Use explicit `WhisperrChannel` values when you need consent or verification
 control.
 
+## Push notifications
+
+The SDK never bundles a push library — hand it the APNs device token (or an
+FCM registration token string) and Whisperr keeps the `push` channel current:
+
+```swift
+func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+) {
+    Task {
+        // Hex-encodes the token and forwards it to setPushToken(_:).
+        try await whisperr.setPushToken(deviceToken: deviceToken)
+    }
+}
+```
+
+- Called **after login**, `setPushToken` re-identifies the push channel
+  immediately.
+- Called **before login**, the token is buffered and attached to the next
+  `identify()`.
+- **Token rotation** is handled: the previously sent token is opted out and
+  the new one opted in, so stale tokens don't accumulate — and tokens from the
+  user's other devices are never touched. The last-sent pair is persisted, so
+  a rotation that happens after an app relaunch still retires the old token.
+- Setting the **same token twice** is a no-op — including across app
+  restarts — so it's safe to call on every launch or token refresh.
+- After `reset()` (logout), call `setPushToken` again once the next user logs
+  in.
+
 ## Track
 
 ```swift
@@ -102,8 +132,9 @@ let whisperr = WhisperrClient(
 )
 ```
 
-The default queue persistence uses `UserDefaults`. For tests or ephemeral
-runtimes, pass `InMemoryWhisperrPersistence()`.
+The default persistence uses `UserDefaults` and stores the pending queue, the
+identified user, and the last-sent push token pair so all three survive app
+restarts. For tests or ephemeral runtimes, pass `InMemoryWhisperrPersistence()`.
 
 ## Development
 

@@ -17,6 +17,25 @@ struct WireCase: Decodable {
     let expectedOccurredAt: String?
 }
 
+struct PushSpec: Decodable {
+    let cases: [PushCase]
+}
+
+struct PushCase: Decodable {
+    let name: String
+    let steps: [PushStep]
+    let expectedBodies: [JSONValue]
+}
+
+/// One step of a push case: exactly one of `identify` / `setPushToken` /
+/// `restart` is set. `restart` tears the client down and builds a fresh one
+/// sharing the same persistence, simulating an app relaunch.
+struct PushStep: Decodable {
+    let identify: [String: JSONValue]?
+    let setPushToken: String?
+    let restart: Bool?
+}
+
 struct BehaviorSpec: Decodable {
     let cases: [BehaviorCase]
 }
