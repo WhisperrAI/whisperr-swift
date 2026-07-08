@@ -27,9 +27,16 @@ final class PushConformanceTests: XCTestCase {
                     if case .object(let object)? = identify["traits"] {
                         traits = object
                     }
-                    try await client.identify(userID, traits: traits)
+                    var pushToken: String?
+                    if case .string(let token)? = identify["pushToken"] {
+                        pushToken = token
+                    }
+                    try await client.identify(userID, traits: traits, pushToken: pushToken)
                 } else if let token = step.setPushToken {
                     try await client.setPushToken(token)
+                } else if step.reset == true {
+                    // Logout: clears the current user and the last-sent pair.
+                    await client.reset()
                 } else if step.restart == true {
                     // App relaunch: tear down the client and build a fresh one
                     // sharing the same persistence; identity and last-sent

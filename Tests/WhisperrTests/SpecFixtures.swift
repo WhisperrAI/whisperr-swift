@@ -28,12 +28,14 @@ struct PushCase: Decodable {
 }
 
 /// One step of a push case: exactly one of `identify` / `setPushToken` /
-/// `restart` is set. `restart` tears the client down and builds a fresh one
-/// sharing the same persistence, simulating an app relaunch.
+/// `restart` / `reset` is set. `restart` tears the client down and builds a
+/// fresh one sharing the same persistence, simulating an app relaunch; `reset`
+/// maps to reset()/logout.
 struct PushStep: Decodable {
     let identify: [String: JSONValue]?
     let setPushToken: String?
     let restart: Bool?
+    let reset: Bool?
 }
 
 struct BehaviorSpec: Decodable {
