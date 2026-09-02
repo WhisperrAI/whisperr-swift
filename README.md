@@ -56,6 +56,8 @@ try await whisperr.identify(
 )
 ```
 
+`identify()` also sends `traits.timezone` (`TimeZone.current.identifier`, an IANA name) and `traits.locale` (`Locale.current`, normalized to BCP 47) by default so quiet hours and message language match the user; values you pass in `traits` always win, and nothing is sent for a value the platform can't provide.
+
 Shortcut `email`, `phone`, and `pushToken` values expand to opted-in channels.
 Use explicit `WhisperrChannel` values when you need consent or verification
 control.

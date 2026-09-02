@@ -14,6 +14,9 @@ public actor WhisperrClient {
     private let clock: @Sendable () -> Date
     private let idGenerator: @Sendable () -> String
     private let sleeper: @Sendable (TimeInterval) async -> Void
+    /// Resolves the reserved identify trait defaults (see `DeviceTraits`);
+    /// injectable so tests can pin or silence them.
+    private let deviceTraits: @Sendable () -> [String: JSONValue]
 
     private var queue: [QueuedOperation] = []
     private var currentUserID: String?
@@ -46,7 +49,8 @@ public actor WhisperrClient {
             }
             let nanoseconds = UInt64(seconds * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanoseconds)
-        }
+        },
+        deviceTraits: (@Sendable () -> [String: JSONValue])? = nil
     ) {
         self.options = options
         self.persistence = options.enablePersistence
@@ -61,6 +65,8 @@ public actor WhisperrClient {
         self.clock = clock
         self.idGenerator = idGenerator
         self.sleeper = sleeper
+        // Internal by design: the resolver is not public API, only its output is.
+        self.deviceTraits = deviceTraits ?? { DeviceTraits.current() }
     }
 
     deinit {
@@ -111,6 +117,12 @@ public actor WhisperrClient {
     }
 
     /// Identifies the current user and persists traits/contact channels.
+    ///
+    /// The reserved traits `timezone` (IANA name, `TimeZone.current`) and
+    /// `locale` (BCP 47, from `Locale.current`) are filled in by default so the
+    /// engine evaluates quiet hours in the user's zone and picks the message
+    /// language; any value you pass in `traits` wins, and a value the platform
+    /// cannot provide is simply omitted.
     public func identify(
         _ externalUserID: String,
         traits: [String: JSONValue] = [:],
@@ -128,8 +140,9 @@ public actor WhisperrClient {
         currentUserID = id
 
         var body: [String: JSONValue] = ["external_user_id": .string(id)]
-        if !traits.isEmpty {
-            body["traits"] = .object(traits)
+        let mergedTraits = withDeviceTraits(traits)
+        if !mergedTraits.isEmpty {
+            body["traits"] = .object(mergedTraits)
         }
         if let preferredChannel {
             body["preferred_channel"] = .string(preferredChannel.rawValue)
@@ -475,6 +488,25 @@ public actor WhisperrClient {
         }
         out.append(contentsOf: explicit)
         return out
+    }
+
+    /// Trait keys the engine reads for the user's zone. Any of them supplied by
+    /// the caller means "don't default `timezone`".
+    private static let timezoneKeys = ["timezone", "time_zone", "tz"]
+
+    /// Merges the device defaults *under* the caller's traits: caller values
+    /// always win, and a key the platform cannot provide is simply absent. Only
+    /// full identify() calls get defaults — `setPushToken`'s partial identify
+    /// stays traits-free by contract.
+    private func withDeviceTraits(_ traits: [String: JSONValue]) -> [String: JSONValue] {
+        var merged = deviceTraits()
+        if Self.timezoneKeys.contains(where: { traits[$0] != nil }) {
+            merged.removeValue(forKey: "timezone")
+        }
+        for (key, value) in traits {
+            merged[key] = value
+        }
+        return merged
     }
 
     /// Records the opted-in push channel (if any) that an identify just sent.

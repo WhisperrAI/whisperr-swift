@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `identify()` now fills the reserved traits `timezone` (IANA name, from
+  `TimeZone.current`) and `locale` (BCP 47, from `Locale.current`) by default,
+  so the engine evaluates quiet hours in the user's zone instead of UTC and
+  picks the message language. Caller-supplied values always win; a value the
+  platform cannot provide is omitted. `setPushToken()`'s partial identify stays
+  traits-free. `WhisperrClient.init` gains an injectable `deviceTraits`
+  resolver (defaulted) for tests.
+
 ## 0.2.1
 
 - Fix: the in-flight restore is now awaited by every entrant. `start()` set a
