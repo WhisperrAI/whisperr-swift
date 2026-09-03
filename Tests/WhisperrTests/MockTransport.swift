@@ -33,7 +33,10 @@ func makeClient(
     maxRetries: Int = 2,
     persistence: WhisperrPersistence? = nil,
     clock: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_780_229_600) },
-    onError: (@Sendable (WhisperrError) -> Void)? = nil
+    onError: (@Sendable (WhisperrError) -> Void)? = nil,
+    // Device-trait defaults are environment-dependent and never pinned by the
+    // spec fixtures; DeviceTraitsTests covers them on the real resolver.
+    deviceTraits: @escaping @Sendable () -> [String: JSONValue] = { [:] }
 ) -> WhisperrClient {
     let ids = IDSequence()
     return WhisperrClient(
@@ -52,7 +55,8 @@ func makeClient(
         transport: transport,
         clock: clock,
         idGenerator: { ids.next() },
-        sleeper: { _ in }
+        sleeper: { _ in },
+        deviceTraits: deviceTraits
     )
 }
 
