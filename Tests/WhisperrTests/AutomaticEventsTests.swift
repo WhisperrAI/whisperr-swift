@@ -94,6 +94,39 @@ final class AutomaticEventsTests: XCTestCase {
         XCTAssertEqual(events[0]["external_user_id"], "user_1")
     }
 
+    /// Raw bytes exactly as 0.2.2 wrote them to UserDefaults: each kind of
+    /// earlier state on its own must suppress app_installed, and the version is
+    /// stored silently so the next version change sends app_updated.
+    func testUpgradeFrom022StateNeverSendsInstalled() async throws {
+        let legacyPayloads: [String: String] = [
+            "identified user": #"{"queue":[],"user_id":"user_1"}"#,
+            "push dedupe pair only": #"{"queue":[],"last_push_user_id":"user_1","last_push_token":"tok_a"}"#,
+            "queued events only": #"{"queue":[{"id":"m1","kind":"track","body":{"external_user_id":"user_1","event_type":"lesson_completed","occurred_at":"2026-05-31T12:13:20.000Z","properties":{},"context":{"$message_id":"m1"}}}]}"#,
+            "0.1.x bare queue array": #"[{"id":"m1","kind":"track","body":{"external_user_id":"user_1","event_type":"lesson_completed","occurred_at":"2026-05-31T12:13:20.000Z","properties":{},"context":{"$message_id":"m1"}}}]"#,
+            "unreadable bytes": "not json"
+        ]
+        for (label, raw) in legacyPayloads {
+            let persistence = InMemoryWhisperrPersistence(data: Data(raw.utf8))
+            let transport = MockTransport()
+            let first = makeLifecycleClient(transport: transport, persistence: persistence)
+            await first.handleAppLaunch(inForeground: false)
+            await first.close()
+
+            let second = makeLifecycleClient(
+                transport: transport,
+                persistence: persistence,
+                environment: .fixture(version: "1.3.0", build: "50")
+            )
+            await second.handleAppLaunch(inForeground: false)
+            await second.flush()
+
+            let types = await transport.sentEvents().compactMap { $0["event_type"]?.stringValue }
+            XCTAssertFalse(types.contains("app_installed"), label)
+            XCTAssertEqual(types.filter { $0 == "app_updated" }, ["app_updated"], label)
+            await second.close()
+        }
+    }
+
     func testWithoutPersistenceNoInstallIsGuessed() async throws {
         let transport = MockTransport()
         let client = makeLifecycleClient(transport: transport, persistence: nil)
@@ -245,6 +278,34 @@ final class PushOpenedTests: XCTestCase {
         XCTAssertEqual([firstSend, repeatSend, afterRestart, other], [true, false, false, true])
         let ids = await transport.sentEvents().map { $0["properties"]?.objectValue?["whisperr_message_id"] }
         XCTAssertEqual(ids, ["msg_1", "msg_2"])
+    }
+
+    func testPushOpenIDIsNotMarkedWhenTheEventIsNotQueued() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport)
+        await client.close()
+
+        do {
+            try await client.trackPushOpened(userInfo: ["whisperr_message_id": "msg_1"])
+            XCTFail("expected closed")
+        } catch let error as WhisperrClientError {
+            XCTAssertEqual(error, .closed)
+        }
+        let remembered = await client.rememberedPushOpenCount
+        XCTAssertEqual(remembered, 0)
+    }
+
+    func testConcurrentDuplicateTapsSendOnce() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport)
+        async let a = client.trackPushOpened(userInfo: ["whisperr_message_id": "msg_1"])
+        async let b = client.trackPushOpened(userInfo: ["whisperr_message_id": "msg_1"])
+        let results = try await [a, b]
+        await client.flush()
+
+        XCTAssertEqual(results.filter { $0 }.count, 1)
+        let ids = await transport.sentEvents().map { $0["properties"]?.objectValue?["whisperr_message_id"] }
+        XCTAssertEqual(ids, ["msg_1"])
     }
 }
 

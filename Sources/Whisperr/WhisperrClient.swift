@@ -38,10 +38,15 @@ public actor WhisperrClient {
     /// app_updated. Persisted.
     private var seenAppVersion: String?
     private var seenAppBuild: String?
-    /// True when restore loaded state that a previous launch saved. An SDK
-    /// upgrade from 0.2.x has state but no seen version: that is not a new
-    /// install.
+    /// True when the device holds any earlier Whisperr state (queue, user id,
+    /// push-token dedupe pair, anonymous id — all in the one persisted key that
+    /// 0.1.x / 0.2.x also wrote), even state that no longer decodes. Earlier
+    /// state with no stored version means an SDK upgrade, not a new install:
+    /// the version is stored silently and nothing is sent.
     private var restoredPriorState = false
+    /// Push message ids whose push_opened is being queued right now, so a
+    /// concurrent duplicate tap cannot pass the dedupe check.
+    private var pushOpensInFlight: Set<String> = []
     /// Push message ids already reported as opened (most recent last). Persisted.
     private var openedPushMessageIDs: [String] = []
     /// Start of the current foreground period, for app_backgrounded.foreground_ms.
@@ -307,8 +312,9 @@ public actor WhisperrClient {
         seenAppBuild = build
         if options.automaticEvents {
             if firstSeen {
-                // State from an older SDK version means the app ran before:
-                // record the version silently instead of a false install.
+                // Earlier state from an older SDK version means the app ran
+                // before: store the version silently (no app_installed, no
+                // app_updated). app_updated fires on the next version change.
                 if !restoredPriorState {
                     await trackAutomatic("app_installed", [:])
                 }
@@ -575,7 +581,9 @@ public actor WhisperrClient {
     @discardableResult
     public func trackPushOpened(_ payload: WhisperrPushPayload) async throws -> Bool {
         try await ensureUsable()
-        guard !optedOut, !openedPushMessageIDs.contains(payload.messageID) else {
+        guard !optedOut,
+              !openedPushMessageIDs.contains(payload.messageID),
+              !pushOpensInFlight.contains(payload.messageID) else {
             return false
         }
         var properties: [String: JSONValue] = [
@@ -584,16 +592,26 @@ public actor WhisperrClient {
         if let deepLink = payload.deepLink {
             properties["deep_link"] = .string(deepLink)
         }
+        pushOpensInFlight.insert(payload.messageID)
+        defer { pushOpensInFlight.remove(payload.messageID) }
+        // Mark the id as sent only after the event is in the persisted queue.
+        // If track throws (client closed), the id stays unmarked.
+        try await track("push_opened", properties: properties)
         openedPushMessageIDs.append(payload.messageID)
         if openedPushMessageIDs.count > Self.maxRememberedPushOpens {
             openedPushMessageIDs.removeFirst(openedPushMessageIDs.count - Self.maxRememberedPushOpens)
         }
-        try await track("push_opened", properties: properties)
+        await persist()
         return true
     }
 
     /// How many opened push message ids are kept for dedupe.
     static let maxRememberedPushOpens = 100
+
+    /// For tests: how many opened push message ids are stored.
+    var rememberedPushOpenCount: Int {
+        openedPushMessageIDs.count
+    }
 
     /// Clears the current user (e.g. on logout) after flushing pending work,
     /// including the persisted identity and last-sent push token pair. The
@@ -769,6 +787,7 @@ public actor WhisperrClient {
         guard let data = await persistence?.load(), !data.isEmpty else {
             return
         }
+        restoredPriorState = true
         var state: PersistedState?
         if let decoded = try? JSONDecoder.whisperr.decode(PersistedState.self, from: data) {
             state = decoded
@@ -782,7 +801,6 @@ public actor WhisperrClient {
         guard let state else {
             return
         }
-        restoredPriorState = true
         // Load persisted state without overwriting anything a caller mutated
         // after start() began (e.g. an identify() or setPushToken() that ran
         // while this restore's `await load()` was suspended): restore only the

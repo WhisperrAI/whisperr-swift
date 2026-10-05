@@ -7,7 +7,10 @@
   (`previous_version`, `previous_build`), `app_opened` (`cold_start`) and
   `app_backgrounded` (`foreground_ms`). Each carries `app_version`,
   `app_build`, `os_name`, `os_version`, `platform`, `locale` and `timezone`.
-  An app that used an older SDK version is not reported as a new install.
+  An upgraded install never sends `app_installed`: when any earlier Whisperr
+  state exists (queue, user id, push-token pair) but no stored version, the
+  version is stored silently and nothing is sent; `app_updated` fires on the
+  next version change.
 - **Flush on background**: the queue is flushed inside a UIKit background task
   when the app goes to the background.
 - **Anonymous visitors** (whisperr-spec `conformance/anonymous.json`):

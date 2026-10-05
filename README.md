@@ -62,8 +62,10 @@ Each one also carries `app_version`, `app_build`, `os_name`, `os_version`,
 `platform` (`"ios"` on iPhone and iPad), `locale` and `timezone`.
 
 Install and update detection compare the app version with the one stored at
-the last launch, so they need persistence (on by default). An app that used an
-older SDK version is not reported as a new install.
+the last launch, so they need persistence (on by default). After an upgrade
+from an older SDK version (earlier Whisperr state, no stored version), the SDK
+stores the version silently and sends neither event; `app_updated` fires on the
+next version change.
 
 Turn the events off with `WhisperrOptions(automaticEvents: false)`. When the
 app goes to the background, the SDK always flushes the queue inside a
