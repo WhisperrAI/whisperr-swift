@@ -27,6 +27,36 @@ public actor WhisperrClient {
     /// so both survive an app restart.
     private var lastPushToken: String?
     private var lastPushUserID: String?
+    /// The device's anonymous handle (whisperr-spec SPEC.md → Anonymous
+    /// visitors). Created on first use by a track before identify, carried by
+    /// the next identify (which promotes it), rotated by reset(). Persisted.
+    private var anonymousID: String?
+    /// Global opt-out: while true nothing is queued or sent. Persisted, and
+    /// kept across reset().
+    private var optedOut = false
+    /// The last app version and build seen at launch, for app_installed /
+    /// app_updated. Persisted.
+    private var seenAppVersion: String?
+    private var seenAppBuild: String?
+    /// True when the device holds any earlier Whisperr state (queue, user id,
+    /// push-token dedupe pair, anonymous id — all in the one persisted key that
+    /// 0.1.x / 0.2.x also wrote), even state that no longer decodes. Earlier
+    /// state with no stored version means an SDK upgrade, not a new install:
+    /// the version is stored silently and nothing is sent.
+    private var restoredPriorState = false
+    /// Push message ids whose push_opened is being queued right now, so a
+    /// concurrent duplicate tap cannot pass the dedupe check.
+    private var pushOpensInFlight: Set<String> = []
+    /// Push message ids already reported as opened (most recent last). Persisted.
+    private var openedPushMessageIDs: [String] = []
+    /// Start of the current foreground period, for app_backgrounded.foreground_ms.
+    private var foregroundSince: Date?
+    /// The first app_opened of this process is the cold start.
+    private var hasOpenedInProcess = false
+    private let appEnvironment: @Sendable () -> AppEnvironment
+    private let anonymousIDGenerator: @Sendable () -> String
+    private let installsLifecycleObserver: Bool
+    private var lifecycleObserver: AnyObject?
     private var closed = false
     /// The one-time restore, shared so every entrant (start / flush /
     /// identify / setPushToken via ensureUsable) awaits the SAME in-flight
@@ -52,6 +82,38 @@ public actor WhisperrClient {
         },
         deviceTraits: (@Sendable () -> [String: JSONValue])? = nil
     ) {
+        self.init(
+            apiKey: apiKey,
+            baseURL: baseURL,
+            options: options,
+            persistence: persistence,
+            transport: transport,
+            clock: clock,
+            idGenerator: idGenerator,
+            sleeper: sleeper,
+            deviceTraits: deviceTraits,
+            appEnvironment: nil,
+            anonymousIDGenerator: nil,
+            installsLifecycleObserver: true
+        )
+    }
+
+    /// Full initializer. `appEnvironment`, `anonymousIDGenerator` and
+    /// `installsLifecycleObserver` exist for tests only.
+    init(
+        apiKey: String,
+        baseURL: URL,
+        options: WhisperrOptions,
+        persistence: WhisperrPersistence?,
+        transport: WhisperrTransport?,
+        clock: @escaping @Sendable () -> Date,
+        idGenerator: @escaping @Sendable () -> String,
+        sleeper: @escaping @Sendable (TimeInterval) async -> Void,
+        deviceTraits: (@Sendable () -> [String: JSONValue])?,
+        appEnvironment: (@Sendable () -> AppEnvironment)?,
+        anonymousIDGenerator: (@Sendable () -> String)?,
+        installsLifecycleObserver: Bool
+    ) {
         self.options = options
         self.persistence = options.enablePersistence
             ? (persistence ?? UserDefaultsWhisperrPersistence())
@@ -67,6 +129,10 @@ public actor WhisperrClient {
         self.sleeper = sleeper
         // Internal by design: the resolver is not public API, only its output is.
         self.deviceTraits = deviceTraits ?? { DeviceTraits.current() }
+        self.appEnvironment = appEnvironment ?? { AppEnvironment.current() }
+        // The spec pins a UUID v4 for the anonymous handle.
+        self.anonymousIDGenerator = anonymousIDGenerator ?? { UUID().uuidString.lowercased() }
+        self.installsLifecycleObserver = installsLifecycleObserver
     }
 
     deinit {
@@ -104,6 +170,7 @@ public actor WhisperrClient {
                 }
             }
         }
+        await attachLifecycle()
     }
 
     public func close() async {
@@ -114,6 +181,177 @@ public actor WhisperrClient {
         closed = true
         flushLoop?.cancel()
         flushLoop = nil
+        lifecycleObserver = nil
+    }
+
+    // MARK: - Opt-out
+
+    /// True while the user is opted out. Persisted across launches and kept
+    /// across `reset()`.
+    public var isOptedOut: Bool {
+        optedOut
+    }
+
+    /// Stops all collection: nothing is queued or sent until `optIn()`. Work
+    /// already queued is discarded. The choice is persisted. This is local to
+    /// the device; it does not delete data already sent.
+    public func optOut() async {
+        await start()
+        optedOut = true
+        let discarded = queue
+        queue.removeAll()
+        pendingPushToken = nil
+        await forgetPushMark(discarded)
+        await persist()
+    }
+
+    /// Resumes collection after `optOut()`.
+    public func optIn() async {
+        await start()
+        optedOut = false
+        await persist()
+    }
+
+    // MARK: - App lifecycle
+
+    /// Installs the UIKit lifecycle observer (flush on background, automatic
+    /// events) and records the launch. No-op on platforms without
+    /// `UIApplication` and inside app extensions.
+    private func attachLifecycle() async {
+        #if canImport(UIKit) && !os(watchOS)
+        guard installsLifecycleObserver, lifecycleObserver == nil, !closed else {
+            return
+        }
+        let inForeground: Bool? = await MainActor.run {
+            guard let app = WhisperrApplication.shared else {
+                return nil
+            }
+            return app.applicationState != .background
+        }
+        guard let inForeground, lifecycleObserver == nil else {
+            return
+        }
+        lifecycleObserver = WhisperrLifecycleObserver(client: self)
+        await handleAppLaunch(inForeground: inForeground)
+        #endif
+    }
+
+    /// Called once per process at launch: sends app_installed / app_updated
+    /// and, when the app launches into the foreground, the cold-start
+    /// app_opened.
+    func handleAppLaunch(inForeground: Bool) async {
+        guard !closed else {
+            return
+        }
+        await start() // persisted state (seen version, user, opt-out) first
+        await recordAppVersion()
+        if inForeground {
+            await appOpened()
+        }
+    }
+
+    func handleWillEnterForeground() async {
+        guard !closed else {
+            return
+        }
+        await start() // persisted state (seen version, user, opt-out) first
+        await appOpened()
+    }
+
+    /// Sends app_backgrounded (with the length of the foreground period) and
+    /// flushes, so the last events of a session leave the device before iOS
+    /// suspends the app.
+    func handleDidEnterBackground() async {
+        guard !closed else {
+            return
+        }
+        await start() // persisted state (seen version, user, opt-out) first
+        let since = foregroundSince
+        foregroundSince = nil
+        if options.automaticEvents {
+            var properties: [String: JSONValue] = [:]
+            if let since {
+                let elapsed = max(0, clock().timeIntervalSince(since))
+                properties["foreground_ms"] = .number((elapsed * 1_000).rounded())
+            }
+            await trackAutomatic("app_backgrounded", properties)
+        }
+        await flush()
+    }
+
+    private func appOpened() async {
+        foregroundSince = clock()
+        let coldStart = !hasOpenedInProcess
+        hasOpenedInProcess = true
+        guard options.automaticEvents else {
+            return
+        }
+        await trackAutomatic("app_opened", ["cold_start": .bool(coldStart)])
+    }
+
+    /// Compares the running app version with the one stored at the last
+    /// launch. Without persistence an install cannot be told from a relaunch,
+    /// so nothing is sent.
+    private func recordAppVersion() async {
+        guard persistence != nil else {
+            return
+        }
+        let environment = appEnvironment()
+        let version = environment.appVersion
+        let build = environment.appBuild
+        guard version != nil || build != nil else {
+            return
+        }
+        guard seenAppVersion != version || seenAppBuild != build else {
+            return
+        }
+        let firstSeen = seenAppVersion == nil && seenAppBuild == nil
+        let previousVersion = seenAppVersion
+        let previousBuild = seenAppBuild
+        seenAppVersion = version
+        seenAppBuild = build
+        if options.automaticEvents {
+            if firstSeen {
+                // Earlier state from an older SDK version means the app ran
+                // before: store the version silently (no app_installed, no
+                // app_updated). app_updated fires on the next version change.
+                if !restoredPriorState {
+                    await trackAutomatic("app_installed", [:])
+                }
+            } else {
+                var properties: [String: JSONValue] = [:]
+                if let previousVersion {
+                    properties["previous_version"] = .string(previousVersion)
+                }
+                if let previousBuild {
+                    properties["previous_build"] = .string(previousBuild)
+                }
+                await trackAutomatic("app_updated", properties)
+            }
+        }
+        await persist()
+    }
+
+    /// The flat properties every automatic event carries: app_version,
+    /// app_build, os_name, os_version, platform, locale, timezone.
+    private func automaticProperties() -> [String: JSONValue] {
+        var out = appEnvironment().properties
+        let traits = deviceTraits()
+        if let locale = traits["locale"] {
+            out["locale"] = locale
+        }
+        if let timezone = traits["timezone"] {
+            out["timezone"] = timezone
+        }
+        return out
+    }
+
+    private func trackAutomatic(_ eventType: String, _ properties: [String: JSONValue]) async {
+        var merged = automaticProperties()
+        for (key, value) in properties {
+            merged[key] = value
+        }
+        try? await track(eventType, properties: merged)
     }
 
     /// Identifies the current user and persists traits/contact channels.
@@ -123,6 +361,11 @@ public actor WhisperrClient {
     /// engine evaluates quiet hours in the user's zone and picks the message
     /// language; any value you pass in `traits` wins, and a value the platform
     /// cannot provide is simply omitted.
+    ///
+    /// When this device already sent events before identify, the body carries
+    /// its `anonymous_id`, so the server promotes those events into this user.
+    /// Events still in the queue are moved to this user before they are sent.
+    /// While the user is opted out, only the local user id is updated.
     public func identify(
         _ externalUserID: String,
         traits: [String: JSONValue] = [:],
@@ -138,8 +381,16 @@ public actor WhisperrClient {
             throw WhisperrClientError.emptyExternalUserID
         }
         currentUserID = id
+        guard !optedOut else {
+            await persist()
+            return
+        }
 
         var body: [String: JSONValue] = ["external_user_id": .string(id)]
+        if let anonymousID {
+            body["anonymous_id"] = .string(anonymousID)
+            backfillAnonymousEvents(userID: id)
+        }
         let mergedTraits = withDeviceTraits(traits)
         if !mergedTraits.isEmpty {
             body["traits"] = .object(mergedTraits)
@@ -195,6 +446,9 @@ public actor WhisperrClient {
     /// to the next identify.
     public func setPushToken(_ token: String) async throws {
         try await ensureUsable()
+        guard !optedOut else {
+            return
+        }
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         // An empty / whitespace token is silently ignored: getToken() can return
         // an empty string before the device has registered, and this is safe to
@@ -239,6 +493,10 @@ public actor WhisperrClient {
     }
 
     /// Tracks a product event for the current user, or for `userID` when supplied.
+    ///
+    /// Before any `identify()` the event is sent right away under the device's
+    /// `anonymous_id`; the next `identify()` promotes it into the user. While
+    /// the user is opted out, this is a no-op.
     public func track(
         _ eventType: String,
         properties: [String: JSONValue] = [:],
@@ -246,11 +504,11 @@ public actor WhisperrClient {
         userID: String? = nil
     ) async throws {
         try await ensureUsable()
+        guard !optedOut else {
+            return
+        }
         let resolvedUserID = (userID ?? currentUserID)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let resolvedUserID, !resolvedUserID.isEmpty else {
-            throw WhisperrClientError.missingUserID
-        }
 
         let type = eventType.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !type.isEmpty else {
@@ -269,13 +527,17 @@ public actor WhisperrClient {
         var mergedContext = context
         mergedContext["$message_id"] = .string(messageID)
 
-        let body: [String: JSONValue] = [
-            "external_user_id": .string(resolvedUserID),
+        var body: [String: JSONValue] = [
             "event_type": .string(type),
             "occurred_at": .string(formatTimestamp(clock())),
             "properties": .object(properties),
             "context": .object(mergedContext)
         ]
+        if let resolvedUserID, !resolvedUserID.isEmpty {
+            body["external_user_id"] = .string(resolvedUserID)
+        } else {
+            body["anonymous_id"] = .string(currentAnonymousID())
+        }
 
         await enqueue(QueuedOperation(
             id: messageID,
@@ -284,15 +546,108 @@ public actor WhisperrClient {
         ))
     }
 
+    /// Sends a `screen_viewed` event with `screen_name`. Call it when a screen
+    /// appears (for example from SwiftUI `.onAppear` or `viewDidAppear`).
+    /// An empty name is ignored.
+    public func screen(_ name: String, properties: [String: JSONValue] = [:]) async throws {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+        var merged = properties
+        merged["screen_name"] = .string(trimmed)
+        try await track("screen_viewed", properties: merged)
+    }
+
+    /// Reports that the user opened a Whisperr push notification: sends
+    /// `push_opened` with `whisperr_message_id` (and `deep_link` when the
+    /// payload has one). Call it from
+    /// `userNotificationCenter(_:didReceive:withCompletionHandler:)`.
+    ///
+    /// Returns false, and sends nothing, when the notification is not from
+    /// Whisperr, when this message id was already reported (the same tap can
+    /// arrive twice, for example at a cold launch), or while opted out.
+    @discardableResult
+    public func trackPushOpened(userInfo: [AnyHashable: Any]) async throws -> Bool {
+        guard let payload = WhisperrPushPayload(userInfo: userInfo) else {
+            return false
+        }
+        return try await trackPushOpened(payload)
+    }
+
+    /// `Sendable` form of `trackPushOpened(userInfo:)`. Use it with Swift 6
+    /// strict concurrency: build the payload from `userInfo` in your delegate,
+    /// then pass it here.
+    @discardableResult
+    public func trackPushOpened(_ payload: WhisperrPushPayload) async throws -> Bool {
+        try await ensureUsable()
+        guard !optedOut,
+              !openedPushMessageIDs.contains(payload.messageID),
+              !pushOpensInFlight.contains(payload.messageID) else {
+            return false
+        }
+        var properties: [String: JSONValue] = [
+            "whisperr_message_id": .string(payload.messageID)
+        ]
+        if let deepLink = payload.deepLink {
+            properties["deep_link"] = .string(deepLink)
+        }
+        pushOpensInFlight.insert(payload.messageID)
+        defer { pushOpensInFlight.remove(payload.messageID) }
+        // Mark the id as sent only after the event is in the persisted queue.
+        // If track throws (client closed), the id stays unmarked.
+        try await track("push_opened", properties: properties)
+        openedPushMessageIDs.append(payload.messageID)
+        if openedPushMessageIDs.count > Self.maxRememberedPushOpens {
+            openedPushMessageIDs.removeFirst(openedPushMessageIDs.count - Self.maxRememberedPushOpens)
+        }
+        await persist()
+        return true
+    }
+
+    /// How many opened push message ids are kept for dedupe.
+    static let maxRememberedPushOpens = 100
+
+    /// For tests: how many opened push message ids are stored.
+    var rememberedPushOpenCount: Int {
+        openedPushMessageIDs.count
+    }
+
     /// Clears the current user (e.g. on logout) after flushing pending work,
-    /// including the persisted identity and last-sent push token pair.
+    /// including the persisted identity and last-sent push token pair. The
+    /// anonymous handle rotates, so the next person on this device is a new
+    /// anonymous visitor.
     public func reset() async {
         await flush()
         currentUserID = nil
         pendingPushToken = nil
         lastPushToken = nil
         lastPushUserID = nil
+        anonymousID = nil // a new handle is created on the next anonymous event
         await persist()
+    }
+
+    /// The device's anonymous handle, created on first use.
+    private func currentAnonymousID() -> String {
+        if let anonymousID {
+            return anonymousID
+        }
+        let created = anonymousIDGenerator()
+        anonymousID = created
+        return created
+    }
+
+    /// Queued pre-identify events go out under the user who just identified.
+    /// Events already sent are promoted by the identify's `anonymous_id`.
+    private func backfillAnonymousEvents(userID: String) {
+        for index in queue.indices where queue[index].kind == .track {
+            guard queue[index].body["external_user_id"] == nil,
+                  queue[index].body["anonymous_id"] != nil else {
+                continue
+            }
+            queue[index].body.removeValue(forKey: "anonymous_id")
+            queue[index].body["external_user_id"] = .string(userID)
+        }
     }
 
     /// Drains the current queue until it is empty or delivery must pause.
@@ -415,6 +770,15 @@ public actor WhisperrClient {
                     return .retryExhausted(nil)
                 }
                 await sleeper(backoff(attempt: retries))
+            case .retryAfter(let seconds):
+                retries += 1
+                if retries > options.maxRetries {
+                    return .retryExhausted(nil)
+                }
+                // The server said when to come back. A small jitter keeps many
+                // devices from retrying in the same instant.
+                let wait = min(max(0, seconds), kWhisperrMaxRetryAfter)
+                await sleeper(wait + Double.random(in: 0...0.25))
             }
         }
     }
@@ -423,6 +787,7 @@ public actor WhisperrClient {
         guard let data = await persistence?.load(), !data.isEmpty else {
             return
         }
+        restoredPriorState = true
         var state: PersistedState?
         if let decoded = try? JSONDecoder.whisperr.decode(PersistedState.self, from: data) {
             state = decoded
@@ -450,6 +815,19 @@ public actor WhisperrClient {
             lastPushUserID = state.lastPushUserID
             lastPushToken = state.lastPushToken
         }
+        if anonymousID == nil {
+            anonymousID = state.anonymousID
+        }
+        if !optedOut {
+            optedOut = state.optedOut ?? false
+        }
+        if seenAppVersion == nil, seenAppBuild == nil {
+            seenAppVersion = state.appVersion
+            seenAppBuild = state.appBuild
+        }
+        if openedPushMessageIDs.isEmpty {
+            openedPushMessageIDs = state.openedPushMessageIDs ?? []
+        }
     }
 
     private func persist() async {
@@ -460,7 +838,12 @@ public actor WhisperrClient {
             queue: queue,
             userID: currentUserID,
             lastPushUserID: lastPushUserID,
-            lastPushToken: lastPushToken
+            lastPushToken: lastPushToken,
+            anonymousID: anonymousID,
+            optedOut: optedOut ? true : nil,
+            appVersion: seenAppVersion,
+            appBuild: seenAppBuild,
+            openedPushMessageIDs: openedPushMessageIDs.isEmpty ? nil : openedPushMessageIDs
         )
         do {
             let data = state.isEmpty ? nil : try JSONEncoder.whisperr.encode(state)
@@ -566,9 +949,11 @@ public actor WhisperrClient {
         }
     }
 
+    /// Exponential backoff with up to 30 % jitter, capped at `maxRetryDelay`.
     private func backoff(attempt: Int) -> TimeInterval {
         let exp = options.retryBaseDelay * pow(2, Double(max(0, attempt - 1)))
-        return min(exp, options.maxRetryDelay)
+        let jittered = exp * (1 + Double.random(in: 0...0.3))
+        return min(jittered, options.maxRetryDelay)
     }
 
     private func isSnakeCase(_ value: String) -> Bool {

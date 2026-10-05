@@ -112,3 +112,26 @@ private func decodeSpec<T: Decodable>(at url: URL) throws -> T {
     let data = try Data(contentsOf: url)
     return try JSONDecoder.whisperr.decode(T.self, from: data)
 }
+
+struct AnonymousSpec: Decodable {
+    let cases: [AnonymousCase]
+}
+
+struct AnonymousCase: Decodable {
+    let name: String
+    let steps: [AnonymousStep]
+    let expectedRequests: [AnonymousExpectedRequest]
+}
+
+/// One step: exactly one of `track` / `identify` / `reset` is set.
+struct AnonymousStep: Decodable {
+    let track: [String: JSONValue]?
+    let identify: [String: JSONValue]?
+    let reset: Bool?
+}
+
+struct AnonymousExpectedRequest: Decodable {
+    let endpoint: String
+    let events: [JSONValue]?
+    let body: JSONValue?
+}

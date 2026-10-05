@@ -18,7 +18,9 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "Whisperr"
+            name: "Whisperr",
+            // Apple privacy manifest: required-reason APIs and collected data.
+            resources: [.copy("PrivacyInfo.xcprivacy")]
         ),
         .testTarget(
             name: "WhisperrTests",

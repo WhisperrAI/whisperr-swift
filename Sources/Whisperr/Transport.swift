@@ -49,6 +49,12 @@ public final class URLSessionWhisperrTransport: WhisperrTransport, @unchecked Se
                 return .auth(http.statusCode)
             }
             if http.statusCode == 429 || http.statusCode >= 500 {
+                // Rate limited / temporarily unavailable: the server may say
+                // when to come back.
+                if http.statusCode == 429 || http.statusCode == 503,
+                   let seconds = parseRetryAfter(http.value(forHTTPHeaderField: "Retry-After")) {
+                    return .retryAfter(seconds)
+                }
                 return .retry
             }
             return .drop(http.statusCode)
@@ -61,4 +67,38 @@ public final class URLSessionWhisperrTransport: WhisperrTransport, @unchecked Se
         let cleanPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         return baseURL.appendingPathComponent(cleanPath)
     }
+}
+
+/// Longest `Retry-After` the SDK honors. A larger value waits this long, then
+/// retries.
+let kWhisperrMaxRetryAfter: TimeInterval = 60
+
+private let httpDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+    return formatter
+}()
+
+/// Parses a `Retry-After` value — delay-seconds or an HTTP-date (RFC 9110
+/// §10.2.3) — into seconds from `now`, capped at `kWhisperrMaxRetryAfter`.
+/// Returns nil when the value is absent or not parseable; the caller then
+/// falls back to exponential backoff.
+func parseRetryAfter(_ value: String?, now: Date = Date()) -> TimeInterval? {
+    guard let raw = value?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
+        return nil
+    }
+    let seconds: TimeInterval
+    if raw.allSatisfy({ $0.isASCII && $0.isNumber }) {
+        guard let parsed = Double(raw) else {
+            return nil
+        }
+        seconds = parsed
+    } else if let date = httpDateFormatter.date(from: raw) {
+        seconds = max(0, date.timeIntervalSince(now))
+    } else {
+        return nil
+    }
+    return min(seconds, kWhisperrMaxRetryAfter)
 }

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- **Automatic events** on UIKit platforms, on by default
+  (`WhisperrOptions.automaticEvents`): `app_installed`, `app_updated`
+  (`previous_version`, `previous_build`), `app_opened` (`cold_start`) and
+  `app_backgrounded` (`foreground_ms`). Each carries `app_version`,
+  `app_build`, `os_name` (lowercase `ios`), `os_version`, `platform` (`ios`),
+  `sdk_name` (`whisperr-swift`), `sdk_version`, `locale` and `timezone` (IANA).
+  An upgraded install never sends `app_installed`: when any earlier Whisperr
+  state exists (queue, user id, push-token pair) but no stored version, the
+  version is stored silently and nothing is sent; `app_updated` fires on the
+  next version change.
+- **Flush on background**: the queue is flushed inside a UIKit background task
+  when the app goes to the background.
+- **Anonymous visitors** (whisperr-spec `conformance/anonymous.json`):
+  `track()` before `identify()` no longer throws `missingUserID`. The event is
+  sent under a persisted `anonymous_id`; the next `identify()` carries it so
+  the server promotes those events; `reset()` rotates it.
+- `screen(_:properties:)` sends `screen_viewed` with `screen_name`.
+- `trackPushOpened(userInfo:)` / `trackPushOpened(_: WhisperrPushPayload)`
+  send `push_opened` with `whisperr_message_id` (and `deep_link`), once per
+  message id. Reads FCM top-level data and OneSignal `custom.a`.
+- `optOut()` / `optIn()` / `isOptedOut`: global, persisted opt-out.
+- `Retry-After` on `429` / `503` is honored (capped at 60 s). Exponential
+  backoff gains up to 30 % jitter. `WhisperrSendResult` gains
+  `.retryAfter(TimeInterval)` for custom transports.
+- Apple privacy manifest `PrivacyInfo.xcprivacy` ships as a package resource.
+- The `email:` shortcut still sends no `verified` key (pinned by a test), so
+  the SDK never marks an address unverified on its own.
+
 ## 0.2.2
 
 - `identify()` now fills the reserved traits `timezone` (IANA name, from
