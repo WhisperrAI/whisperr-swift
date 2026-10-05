@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+This is a minor release (0.4.0). It makes push work end to end on iOS.
+
+- **APNs token with its type.** `setPushToken(_ deviceToken: Data)` sends the
+  token as lowercase hex with `kind: "apns"`, `platform` and `push_env`. The
+  SDK finds the APNs environment from the embedded provisioning profile, then
+  the simulator, then the `DEBUG` build flag. An `environment:` parameter
+  overrides it. `setPushToken(deviceToken:)` from 0.3 still works.
+- **FCM token with its type.** `setPushToken(fcmToken:)` sends `kind: "fcm"`.
+  `setPushToken(_:kind:platform:environment:)` takes any token type. A bare
+  string sends no type, as in 0.3, and the server infers it.
+- **Dedupe on token fields.** The SDK sends the token again when a field
+  changes (for example the environment), and never opts out the same token.
+  An install upgraded from 0.3 sends its `kind` and `push_env` one time.
+- **Permission.** `pushPermissionChanged(_:)` and `refreshPushPermission()`
+  send `push_permission_changed` (`status`, `previous_status`) when the status
+  changes. The SDK also reads the status on each move to the foreground.
+  `WhisperrOptions(automaticPushPermission: false)` stops the read.
+- **Opens and deep links.** `handleNotificationResponse(_:)` sends
+  `push_opened` and returns the deep link (`whisperr_deep_link`, or the older
+  `deep_link`). A dismissal sends nothing. `handleNotification(_:)` is the
+  `Sendable` form.
+- **Static push helpers.** `Whisperr.setPushToken`, `Whisperr.pushPermissionChanged`,
+  `Whisperr.refreshPushPermission`, `Whisperr.handleNotificationResponse`,
+  `Whisperr.handleLaunchOptions` and `Whisperr.consumePendingDeepLink` are
+  synchronous and never throw. A call before `initialize` finishes waits for
+  it. `Whisperr.deepLinkNotification` tells the UI that a link is waiting
+  (cold start).
+- **Rich push.** New product `WhisperrNotificationServiceExtension`:
+  subclass `WhisperrNotificationService` in a Notification Service Extension
+  to attach the image in `whisperr_image_url`. It has a timeout, a size limit,
+  and a safe fallback. `WhisperrRichPush.attachImage` works in an extension
+  you already have.
+- **Common properties.** `screen_viewed` and `push_opened` now carry the same
+  app and OS properties as the lifecycle events, as whisperr-spec
+  `automatic.json` requires. The test suite now runs `automatic.json` and the
+  `push.json` kind cases.
+
 ## 0.3.0
 
 This is a minor release. Automatic events are on by default, so apps that

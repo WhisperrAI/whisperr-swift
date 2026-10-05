@@ -8,22 +8,35 @@ public enum WhisperrChannelType: String, Codable, Sendable {
 }
 
 /// A reachable address or token for a user.
+///
+/// `kind`, `platform` and `pushEnvironment` describe a push token (whisperr-spec
+/// SPEC.md → Token kind). They are sent only on `push` channels and only when
+/// set: the server infers a missing kind from the token.
 public struct WhisperrChannel: Equatable, Sendable {
     public let type: WhisperrChannelType
     public let address: String
     public let optedIn: Bool?
     public let verified: Bool?
+    public let kind: WhisperrPushKind?
+    public let platform: WhisperrPushPlatform?
+    public let pushEnvironment: WhisperrPushEnvironment?
 
     public init(
         type: WhisperrChannelType,
         address: String,
         optedIn: Bool? = nil,
-        verified: Bool? = nil
+        verified: Bool? = nil,
+        kind: WhisperrPushKind? = nil,
+        platform: WhisperrPushPlatform? = nil,
+        pushEnvironment: WhisperrPushEnvironment? = nil
     ) {
         self.type = type
         self.address = address
         self.optedIn = optedIn
         self.verified = verified
+        self.kind = kind
+        self.platform = platform
+        self.pushEnvironment = pushEnvironment
     }
 
     public static func email(
@@ -45,9 +58,29 @@ public struct WhisperrChannel: Equatable, Sendable {
     public static func push(
         _ token: String,
         optedIn: Bool? = nil,
-        verified: Bool? = nil
+        verified: Bool? = nil,
+        kind: WhisperrPushKind? = nil,
+        platform: WhisperrPushPlatform? = nil,
+        pushEnvironment: WhisperrPushEnvironment? = nil
     ) -> WhisperrChannel {
-        WhisperrChannel(type: .push, address: token, optedIn: optedIn, verified: verified)
+        WhisperrChannel(
+            type: .push,
+            address: token,
+            optedIn: optedIn,
+            verified: verified,
+            kind: kind,
+            platform: platform,
+            pushEnvironment: pushEnvironment
+        )
+    }
+
+    /// True when this push entry sets a token field (kind, platform or
+    /// environment) to a value other than `known`. The server keeps a stored
+    /// value when a field is not sent, so a missing field is not a change.
+    func addsPushMetadata(to known: PushMetadata) -> Bool {
+        (kind != nil && kind?.rawValue != known.kind)
+            || (platform != nil && platform?.rawValue != known.platform)
+            || (pushEnvironment != nil && pushEnvironment?.rawValue != known.pushEnvironment)
     }
 
     var body: [String: JSONValue] {
@@ -61,7 +94,40 @@ public struct WhisperrChannel: Equatable, Sendable {
         if let verified {
             out["verified"] = .bool(verified)
         }
+        if type == .push {
+            if let kind {
+                out["kind"] = .string(kind.rawValue)
+            }
+            if let platform {
+                out["platform"] = .string(platform.rawValue)
+            }
+            if let pushEnvironment {
+                out["push_env"] = .string(pushEnvironment.rawValue)
+            }
+        }
         return out
+    }
+}
+
+/// The token fields last delivered for the remembered push token, as wire
+/// strings. Persisted with the (user, token) pair.
+struct PushMetadata: Equatable, Sendable {
+    var kind: String?
+    var platform: String?
+    var pushEnvironment: String?
+
+    /// Applies the fields a delivered entry sent. A field it did not send
+    /// keeps its value, as on the server.
+    mutating func merge(_ channel: WhisperrChannel) {
+        if let kind = channel.kind {
+            self.kind = kind.rawValue
+        }
+        if let platform = channel.platform {
+            self.platform = platform.rawValue
+        }
+        if let environment = channel.pushEnvironment {
+            self.pushEnvironment = environment.rawValue
+        }
     }
 }
 
@@ -110,6 +176,12 @@ public struct WhisperrOptions: Sendable {
     /// visionOS, Mac Catalyst). On by default. The flush when the app goes to
     /// the background happens whatever this value is.
     public var automaticEvents: Bool
+    /// Reads the notification permission (`getNotificationSettings`, no
+    /// prompt) on each move to the foreground and sends
+    /// `push_permission_changed` when it differs from the last value sent.
+    /// On by default; it also needs `automaticEvents`. Calls to
+    /// `pushPermissionChanged(_:)` always send.
+    public var automaticPushPermission: Bool
     public var onError: (@Sendable (WhisperrError) -> Void)?
 
     public init(
@@ -124,6 +196,7 @@ public struct WhisperrOptions: Sendable {
         enablePersistence: Bool = true,
         debug: Bool = false,
         automaticEvents: Bool = true,
+        automaticPushPermission: Bool = true,
         onError: (@Sendable (WhisperrError) -> Void)? = nil
     ) {
         self.flushInterval = max(0, flushInterval)
@@ -137,6 +210,7 @@ public struct WhisperrOptions: Sendable {
         self.enablePersistence = enablePersistence
         self.debug = debug
         self.automaticEvents = automaticEvents
+        self.automaticPushPermission = automaticPushPermission
         self.onError = onError
     }
 }
@@ -157,8 +231,9 @@ struct QueuedOperation: Codable, Equatable, Sendable {
 /// capture — so same-token dedupe and rotation opt-out survive app restarts.
 /// It also holds the anonymous handle, the opt-out flag, the last app
 /// version seen (for `app_installed` / `app_updated`) and the push message ids
-/// already reported as opened. Fields added after 0.2.2 are optional so older
-/// state still decodes.
+/// already reported as opened, the token fields (kind, platform, environment)
+/// last delivered with the push token, and the last notification permission
+/// sent. Fields added after 0.2.2 are optional so older state still decodes.
 struct PersistedState: Codable, Equatable, Sendable {
     var queue: [QueuedOperation] = []
     var userID: String?
@@ -169,11 +244,17 @@ struct PersistedState: Codable, Equatable, Sendable {
     var appVersion: String?
     var appBuild: String?
     var openedPushMessageIDs: [String]?
+    var lastPushKind: String?
+    var lastPushPlatform: String?
+    var lastPushEnvironment: String?
+    var pushPermission: String?
 
     var isEmpty: Bool {
         queue.isEmpty && userID == nil && lastPushUserID == nil && lastPushToken == nil
             && anonymousID == nil && optedOut != true && appVersion == nil && appBuild == nil
             && (openedPushMessageIDs ?? []).isEmpty
+            && lastPushKind == nil && lastPushPlatform == nil && lastPushEnvironment == nil
+            && pushPermission == nil
     }
 
     enum CodingKeys: String, CodingKey {
@@ -186,6 +267,10 @@ struct PersistedState: Codable, Equatable, Sendable {
         case appVersion = "app_version"
         case appBuild = "app_build"
         case openedPushMessageIDs = "opened_push_message_ids"
+        case lastPushKind = "last_push_kind"
+        case lastPushPlatform = "last_push_platform"
+        case lastPushEnvironment = "last_push_env"
+        case pushPermission = "push_permission"
     }
 }
 

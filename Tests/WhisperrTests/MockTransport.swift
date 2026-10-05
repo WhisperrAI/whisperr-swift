@@ -109,7 +109,11 @@ func makeLifecycleClient(
         ["timezone": "Europe/Berlin", "locale": "de-DE"]
     },
     sleeper: @escaping @Sendable (TimeInterval) async -> Void = { _ in },
-    maxRetries: Int = 2
+    maxRetries: Int = 2,
+    automaticPushPermission: Bool = true,
+    // nil: the permission cannot be read, so lifecycle tests see no
+    // push_permission_changed unless they opt in.
+    pushPermission: @escaping @Sendable () async -> WhisperrPushPermissionStatus? = { nil }
 ) -> WhisperrClient {
     let ids = IDSequence()
     let anonIDs = IDSequence()
@@ -123,7 +127,8 @@ func makeLifecycleClient(
             retryBaseDelay: 0,
             maxRetryDelay: 0,
             enablePersistence: persistence != nil,
-            automaticEvents: automaticEvents
+            automaticEvents: automaticEvents,
+            automaticPushPermission: automaticPushPermission
         ),
         persistence: persistence,
         transport: transport,
@@ -133,7 +138,8 @@ func makeLifecycleClient(
         deviceTraits: deviceTraits,
         appEnvironment: { environment },
         anonymousIDGenerator: { "anon-" + anonIDs.next() },
-        installsLifecycleObserver: false
+        installsLifecycleObserver: false,
+        pushPermissionProvider: pushPermission
     )
 }
 
