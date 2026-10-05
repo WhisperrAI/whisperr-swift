@@ -1,34 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
-- **Automatic events** on UIKit platforms, on by default
-  (`WhisperrOptions.automaticEvents`): `app_installed`, `app_updated`
-  (`previous_version`, `previous_build`), `app_opened` (`cold_start`) and
-  `app_backgrounded` (`foreground_ms`). Each carries `app_version`,
-  `app_build`, `os_name` (lowercase `ios`), `os_version`, `platform` (`ios`),
-  `sdk_name` (`whisperr-swift`), `sdk_version`, `locale` and `timezone` (IANA).
-  An upgraded install never sends `app_installed`: when any earlier Whisperr
-  state exists (queue, user id, push-token pair) but no stored version, the
-  version is stored silently and nothing is sent; `app_updated` fires on the
-  next version change.
-- **Flush on background**: the queue is flushed inside a UIKit background task
-  when the app goes to the background.
-- **Anonymous visitors** (whisperr-spec `conformance/anonymous.json`):
-  `track()` before `identify()` no longer throws `missingUserID`. The event is
-  sent under a persisted `anonymous_id`; the next `identify()` carries it so
-  the server promotes those events; `reset()` rotates it.
-- `screen(_:properties:)` sends `screen_viewed` with `screen_name`.
-- `trackPushOpened(userInfo:)` / `trackPushOpened(_: WhisperrPushPayload)`
-  send `push_opened` with `whisperr_message_id` (and `deep_link`), once per
-  message id. Reads FCM top-level data and OneSignal `custom.a`.
-- `optOut()` / `optIn()` / `isOptedOut`: global, persisted opt-out.
-- `Retry-After` on `429` / `503` is honored (capped at 60 s). Exponential
-  backoff gains up to 30 % jitter. `WhisperrSendResult` gains
-  `.retryAfter(TimeInterval)` for custom transports.
-- Apple privacy manifest `PrivacyInfo.xcprivacy` ships as a package resource.
-- The `email:` shortcut still sends no `verified` key (pinned by a test), so
-  the SDK never marks an address unverified on its own.
+This is a minor release. Automatic events are on by default, so apps that
+depend on `0.2.x` do not get them until they move to `0.3.0`.
+
+- **Automatic events.** On UIKit platforms the SDK sends `app_installed`,
+  `app_updated`, `app_opened` and `app_backgrounded` by itself. It also sends
+  the queue when the app goes to the background. An upgrade from 0.2.x never
+  sends `app_installed`.
+- **Off switch.** `WhisperrOptions(automaticEvents: false)` stops automatic
+  events.
+- **Anonymous visitors.** `track()` before `identify()` no longer throws. The
+  event goes out under a saved `anonymous_id`. The next `identify()` links
+  those events to the user. `reset()` makes a new id.
+- **Screens.** `screen(_:properties:)` sends `screen_viewed`.
+- **Push opens.** `trackPushOpened(userInfo:)` sends `push_opened` one time for
+  each Whisperr message. It reads FCM and OneSignal payloads.
+- **Opt-out.** `optOut()`, `optIn()` and `isOptedOut`. The choice is saved on
+  the device. When a user opts out, the SDK sends nothing and clears its queue.
+- **Retry-After.** On `429` and `503` the SDK waits as long as the server asks
+  (60 s at most). Retries also get random jitter.
+- **Privacy manifest.** The package ships `PrivacyInfo.xcprivacy`. The SDK does
+  no tracking. The manifest declares the user ID, the anonymous device ID and
+  product interaction.
+
+### Breaking change
+
+- `WhisperrSendResult` has a new case, `.retryAfter(TimeInterval)`. Code that
+  switches over this enum, for example a custom `WhisperrTransport` that wraps
+  another one, must handle the new case or it will not compile.
 
 ## 0.2.2
 
