@@ -19,7 +19,8 @@ final class AnonymousConformanceTests: XCTestCase {
             let client = WhisperrClient(
                 apiKey: "wrk_test",
                 baseURL: URL(string: "https://api.test")!,
-                options: WhisperrOptions(flushInterval: 0, maxRetries: 0),
+                // Spec conformance runs never include automatic events.
+                options: WhisperrOptions(flushInterval: 0, maxRetries: 0, automaticEvents: false),
                 persistence: InMemoryWhisperrPersistence(),
                 transport: transport,
                 sleeper: { _ in },

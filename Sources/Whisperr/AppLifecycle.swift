@@ -4,8 +4,11 @@ import UIKit
 #endif
 
 /// App and OS facts that every automatic event carries as flat properties:
-/// `app_version`, `app_build`, `os_name`, `os_version`, `platform`.
-/// (`locale` and `timezone` come from `DeviceTraits`.)
+/// `app_version`, `app_build`, `os_name`, `os_version`, `platform`,
+/// `sdk_name`, `sdk_version`. (`locale` and `timezone` come from
+/// `DeviceTraits`.) Values are the canonical ones shared by all SDKs:
+/// `platform` is the OS family (never the framework) and `os_name` is
+/// lowercase.
 struct AppEnvironment: Sendable, Equatable {
     var appVersion: String?
     var appBuild: String?
@@ -35,7 +38,9 @@ struct AppEnvironment: Sendable, Equatable {
         var out: [String: JSONValue] = [
             "os_name": .string(osName),
             "os_version": .string(osVersion),
-            "platform": .string(platform)
+            "platform": .string(platform),
+            "sdk_name": "whisperr-swift",
+            "sdk_version": .string(kWhisperrSdkVersion)
         ]
         if let appVersion {
             out["app_version"] = .string(appVersion)
@@ -48,17 +53,17 @@ struct AppEnvironment: Sendable, Equatable {
 
     private static var osName: String {
         #if targetEnvironment(macCatalyst)
-        return "macOS"
+        return "macos"
         #elseif os(iOS)
-        return "iOS"
+        return "ios" // iPhone and iPad are not told apart
         #elseif os(tvOS)
-        return "tvOS"
+        return "tvos"
         #elseif os(watchOS)
-        return "watchOS"
+        return "watchos"
         #elseif os(visionOS)
-        return "visionOS"
+        return "visionos"
         #elseif os(macOS)
-        return "macOS"
+        return "macos"
         #else
         return "unknown"
         #endif

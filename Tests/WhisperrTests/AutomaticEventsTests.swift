@@ -7,7 +7,8 @@ import XCTest
 /// `handleDidEnterBackground`).
 final class AutomaticEventsTests: XCTestCase {
     private let commonKeys: Set<String> = [
-        "app_version", "app_build", "os_name", "os_version", "platform", "locale", "timezone"
+        "app_version", "app_build", "os_name", "os_version", "platform", "locale", "timezone",
+        "sdk_name", "sdk_version"
     ]
 
     func testFirstLaunchSendsInstalledAndColdOpenWithCommonProperties() async throws {
@@ -24,9 +25,11 @@ final class AutomaticEventsTests: XCTestCase {
         XCTAssertEqual(installed, [
             "app_version": "1.2.0",
             "app_build": "42",
-            "os_name": "iOS",
+            "os_name": "ios",
             "os_version": "18.1",
             "platform": "ios",
+            "sdk_name": "whisperr-swift",
+            "sdk_version": .string(kWhisperrSdkVersion),
             "locale": "de-DE",
             "timezone": "Europe/Berlin"
         ])
@@ -215,7 +218,9 @@ final class AutomaticEventsTests: XCTestCase {
         XCTAssertTrue(environment.osVersion.contains("."))
         #if os(macOS)
         XCTAssertEqual(environment.platform, "macos")
+        XCTAssertEqual(environment.osName, "macos")
         #endif
+        XCTAssertEqual(environment.osName, environment.osName.lowercased())
     }
 }
 

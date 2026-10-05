@@ -58,8 +58,10 @@ with no extra code:
 | `app_opened` | `cold_start` | the app comes to the foreground (`true` the first time in the process) |
 | `app_backgrounded` | `foreground_ms` | the app goes to the background |
 
-Each one also carries `app_version`, `app_build`, `os_name`, `os_version`,
-`platform` (`"ios"` on iPhone and iPad), `locale` and `timezone`.
+Each one also carries `app_version`, `app_build`, `os_name` (lowercase, `"ios"`
+on iPhone and iPad), `os_version`, `platform` (the OS family, `"ios"`),
+`sdk_name` (`"whisperr-swift"`), `sdk_version`, `locale` and `timezone` (IANA
+name).
 
 Install and update detection compare the app version with the one stored at
 the last launch, so they need persistence (on by default). After an upgrade

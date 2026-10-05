@@ -49,6 +49,8 @@ func makeClient(
             retryBaseDelay: 0,
             maxRetryDelay: 0,
             enablePersistence: true,
+            // Spec conformance runs never include automatic events.
+            automaticEvents: false,
             onError: onError
         ),
         persistence: persistence ?? InMemoryWhisperrPersistence(),
@@ -140,7 +142,7 @@ extension AppEnvironment {
         AppEnvironment(
             appVersion: version,
             appBuild: build,
-            osName: "iOS",
+            osName: "ios",
             osVersion: "18.1",
             platform: "ios"
         )

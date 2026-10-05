@@ -6,7 +6,8 @@
   (`WhisperrOptions.automaticEvents`): `app_installed`, `app_updated`
   (`previous_version`, `previous_build`), `app_opened` (`cold_start`) and
   `app_backgrounded` (`foreground_ms`). Each carries `app_version`,
-  `app_build`, `os_name`, `os_version`, `platform`, `locale` and `timezone`.
+  `app_build`, `os_name` (lowercase `ios`), `os_version`, `platform` (`ios`),
+  `sdk_name` (`whisperr-swift`), `sdk_version`, `locale` and `timezone` (IANA).
   An upgraded install never sends `app_installed`: when any earlier Whisperr
   state exists (queue, user id, push-token pair) but no stored version, the
   version is stored silently and nothing is sent; `app_updated` fires on the
