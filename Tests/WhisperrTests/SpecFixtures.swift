@@ -19,6 +19,8 @@ struct WireCase: Decodable {
 
 struct PushSpec: Decodable {
     let cases: [PushCase]
+    /// Flows for SDKs that send kind / platform / push_env.
+    let kindCases: [PushCase]?
 }
 
 struct PushCase: Decodable {
@@ -33,9 +35,37 @@ struct PushCase: Decodable {
 /// maps to reset()/logout.
 struct PushStep: Decodable {
     let identify: [String: JSONValue]?
-    let setPushToken: String?
+    let setPushToken: PushTokenStep?
     let restart: Bool?
     let reset: Bool?
+}
+
+/// `setPushToken` is a bare token string, or (in `kindCases`) an object with
+/// the token and its optional kind, platform and pushEnv.
+struct PushTokenStep: Decodable {
+    let token: String
+    let kind: String?
+    let platform: String?
+    let pushEnv: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case token, kind, platform, pushEnv
+    }
+
+    init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer(), let token = try? single.decode(String.self) {
+            self.token = token
+            self.kind = nil
+            self.platform = nil
+            self.pushEnv = nil
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        token = try container.decode(String.self, forKey: .token)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind)
+        platform = try container.decodeIfPresent(String.self, forKey: .platform)
+        pushEnv = try container.decodeIfPresent(String.self, forKey: .pushEnv)
+    }
 }
 
 struct BehaviorSpec: Decodable {

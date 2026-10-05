@@ -13,7 +13,8 @@ struct AppEnvironment: Sendable, Equatable {
     var appVersion: String?
     var appBuild: String?
     var osName: String
-    var osVersion: String
+    /// Nil only when a test harness models a runtime that cannot supply it.
+    var osVersion: String?
     var platform: String
 
     static func current(bundle: Bundle = .main) -> AppEnvironment {
@@ -37,11 +38,13 @@ struct AppEnvironment: Sendable, Equatable {
     var properties: [String: JSONValue] {
         var out: [String: JSONValue] = [
             "os_name": .string(osName),
-            "os_version": .string(osVersion),
             "platform": .string(platform),
             "sdk_name": "whisperr-swift",
             "sdk_version": .string(kWhisperrSdkVersion)
         ]
+        if let osVersion {
+            out["os_version"] = .string(osVersion)
+        }
         if let appVersion {
             out["app_version"] = .string(appVersion)
         }
@@ -87,56 +90,6 @@ struct AppEnvironment: Sendable, Equatable {
 
     private static func nonEmpty(_ value: String?) -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-}
-
-/// The Whisperr fields of a push notification payload.
-///
-/// The Whisperr backend puts `whisperr_message_id` (and, when the message has
-/// one, `deep_link`) in the push data. FCM delivers data keys at the top level
-/// of `userInfo`; OneSignal nests them under `custom.a`. Both are read.
-///
-/// Build this synchronously from `userInfo` inside your notification delegate
-/// when your app uses Swift 6 strict concurrency, then pass the value (it is
-/// `Sendable`) to `WhisperrClient.trackPushOpened(_:)`.
-public struct WhisperrPushPayload: Sendable, Equatable {
-    public let messageID: String
-    public let deepLink: String?
-
-    public init(messageID: String, deepLink: String? = nil) {
-        self.messageID = messageID
-        self.deepLink = deepLink
-    }
-
-    /// Returns nil when the notification was not sent by Whisperr (no
-    /// `whisperr_message_id`).
-    public init?(userInfo: [AnyHashable: Any]) {
-        let sources = Self.dataDictionaries(in: userInfo)
-        guard let messageID = sources.lazy.compactMap({ Self.string($0["whisperr_message_id"]) }).first else {
-            return nil
-        }
-        self.messageID = messageID
-        self.deepLink = sources.lazy.compactMap { Self.string($0["deep_link"]) }.first
-    }
-
-    private static func dataDictionaries(in userInfo: [AnyHashable: Any]) -> [[AnyHashable: Any]] {
-        var out: [[AnyHashable: Any]] = [userInfo]
-        if let data = userInfo["data"] as? [AnyHashable: Any] {
-            out.append(data)
-        }
-        if let custom = userInfo["custom"] as? [AnyHashable: Any],
-           let additional = custom["a"] as? [AnyHashable: Any] {
-            out.append(additional)
-        }
-        return out
-    }
-
-    private static func string(_ value: Any?) -> String? {
-        guard let value = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
             return nil
         }
         return value

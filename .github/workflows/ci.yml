@@ -20,6 +20,10 @@ jobs:
         run: swift test
         env:
           WHISPERR_SPEC_PATH: ${{ github.workspace }}/whisperr-spec/conformance/wire.json
+      # With two library products, Xcode names the all-targets scheme
+      # "whisperr-swift-Package".
       - name: Build for iOS
         # swift test runs on macOS only; this compiles the UIKit code paths.
-        run: xcodebuild -scheme whisperr-swift -destination 'generic/platform=iOS' build CODE_SIGNING_ALLOWED=NO
+        run: xcodebuild -scheme whisperr-swift-Package -destination 'generic/platform=iOS' build CODE_SIGNING_ALLOWED=NO
+      - name: Build for iOS Simulator
+        run: xcodebuild -scheme whisperr-swift-Package -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO

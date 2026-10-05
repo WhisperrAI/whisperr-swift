@@ -1,6 +1,9 @@
 import Foundation
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
 
-public let kWhisperrSdkVersion = "0.3.0"
+public let kWhisperrSdkVersion = "0.4.0"
 public let kWhisperrDefaultBaseURL = URL(string: "https://api.whisperr.net")!
 
 private let eventTypePattern = try! NSRegularExpression(
@@ -20,13 +23,21 @@ public actor WhisperrClient {
 
     private var queue: [QueuedOperation] = []
     private var currentUserID: String?
-    /// Token captured before identify(); attached to the next identify.
-    private var pendingPushToken: String?
+    /// Push entry captured before identify(); attached to the next identify.
+    private var pendingPush: WhisperrChannel?
     /// Last push token delivered and for which user — dedups refresh storms and
     /// lets a rotation opt the previous token out. Persisted (with the identity)
     /// so both survive an app restart.
     private var lastPushToken: String?
     private var lastPushUserID: String?
+    /// The token fields (kind, platform, environment) delivered with
+    /// `lastPushToken`. A same-token call that sets a new field sends again,
+    /// so an install upgraded from 0.3.x reports its APNs environment once.
+    private var lastPushMetadata = PushMetadata()
+    /// The last notification permission sent as push_permission_changed.
+    /// Persisted; reset() clears it.
+    private var lastPushPermission: String?
+    private let pushPermissionProvider: @Sendable () async -> WhisperrPushPermissionStatus?
     /// The device's anonymous handle (whisperr-spec SPEC.md → Anonymous
     /// visitors). Created on first use by a track before identify, carried by
     /// the next identify (which promotes it), rotated by reset(). Persisted.
@@ -94,12 +105,14 @@ public actor WhisperrClient {
             deviceTraits: deviceTraits,
             appEnvironment: nil,
             anonymousIDGenerator: nil,
-            installsLifecycleObserver: true
+            installsLifecycleObserver: true,
+            pushPermissionProvider: nil
         )
     }
 
-    /// Full initializer. `appEnvironment`, `anonymousIDGenerator` and
-    /// `installsLifecycleObserver` exist for tests only.
+    /// Full initializer. `appEnvironment`, `anonymousIDGenerator`,
+    /// `installsLifecycleObserver` and `pushPermissionProvider` exist for
+    /// tests only.
     init(
         apiKey: String,
         baseURL: URL,
@@ -112,7 +125,8 @@ public actor WhisperrClient {
         deviceTraits: (@Sendable () -> [String: JSONValue])?,
         appEnvironment: (@Sendable () -> AppEnvironment)?,
         anonymousIDGenerator: (@Sendable () -> String)?,
-        installsLifecycleObserver: Bool
+        installsLifecycleObserver: Bool,
+        pushPermissionProvider: (@Sendable () async -> WhisperrPushPermissionStatus?)? = nil
     ) {
         self.options = options
         self.persistence = options.enablePersistence
@@ -133,6 +147,7 @@ public actor WhisperrClient {
         // The spec pins a UUID v4 for the anonymous handle.
         self.anonymousIDGenerator = anonymousIDGenerator ?? { UUID().uuidString.lowercased() }
         self.installsLifecycleObserver = installsLifecycleObserver
+        self.pushPermissionProvider = pushPermissionProvider ?? { await WhisperrPushPermission.current() }
     }
 
     deinit {
@@ -200,7 +215,7 @@ public actor WhisperrClient {
         optedOut = true
         let discarded = queue
         queue.removeAll()
-        pendingPushToken = nil
+        pendingPush = nil
         await forgetPushMark(discarded)
         await persist()
     }
@@ -247,6 +262,7 @@ public actor WhisperrClient {
         await recordAppVersion()
         if inForeground {
             await appOpened()
+            await refreshPushPermissionIfAutomatic()
         }
     }
 
@@ -256,6 +272,7 @@ public actor WhisperrClient {
         }
         await start() // persisted state (seen version, user, opt-out) first
         await appOpened()
+        await refreshPushPermissionIfAutomatic()
     }
 
     /// Sends app_backgrounded (with the length of the foreground period) and
@@ -332,8 +349,10 @@ public actor WhisperrClient {
         await persist()
     }
 
-    /// The flat properties every automatic event carries: app_version,
-    /// app_build, os_name, os_version, platform, locale, timezone.
+    /// The flat properties every reserved event carries: app_version,
+    /// app_build, os_name, os_version, platform, sdk_name, sdk_version,
+    /// locale, timezone (or timezone_offset_minutes when no IANA name is
+    /// known).
     private func automaticProperties() -> [String: JSONValue] {
         var out = appEnvironment().properties
         let traits = deviceTraits()
@@ -342,16 +361,23 @@ public actor WhisperrClient {
         }
         if let timezone = traits["timezone"] {
             out["timezone"] = timezone
+        } else if let offset = traits["timezone_offset_minutes"] {
+            out["timezone_offset_minutes"] = offset
         }
         return out
     }
 
-    private func trackAutomatic(_ eventType: String, _ properties: [String: JSONValue]) async {
+    /// The common properties with `properties` on top (event values win).
+    private func withAutomaticProperties(_ properties: [String: JSONValue]) -> [String: JSONValue] {
         var merged = automaticProperties()
         for (key, value) in properties {
             merged[key] = value
         }
-        try? await track(eventType, properties: merged)
+        return merged
+    }
+
+    private func trackAutomatic(_ eventType: String, _ properties: [String: JSONValue]) async {
+        try? await track(eventType, properties: withAutomaticProperties(properties))
     }
 
     /// Identifies the current user and persists traits/contact channels.
@@ -407,12 +433,13 @@ public actor WhisperrClient {
         )
         // A token buffered by setPushToken() rides along unless the caller
         // supplied its own push channel — or it matches the (restored)
-        // last-sent pair for this user, in which case there is nothing new
-        // to send.
-        if let pending = pendingPushToken,
+        // last-sent pair for this user with no new token fields, in which
+        // case there is nothing new to send.
+        if let pending = pendingPush,
            !resolvedChannels.contains(where: { $0.type == .push }),
-           !(lastPushUserID == id && lastPushToken == pending) {
-            resolvedChannels.append(.push(pending, optedIn: true))
+           !(lastPushUserID == id && lastPushToken == pending.address
+               && !pending.addsPushMetadata(to: lastPushMetadata)) {
+            resolvedChannels.append(pending)
         }
         // Rotation: if this identify registers a push token that differs from
         // the last one we sent for this user, opt the old one out in the same
@@ -425,7 +452,7 @@ public actor WhisperrClient {
             resolvedChannels.insert(.push(last, optedIn: false), at: 0)
         }
         rememberPushChannel(userID: id, channels: resolvedChannels)
-        pendingPushToken = nil
+        pendingPush = nil
         if !resolvedChannels.isEmpty {
             body["channels"] = .array(resolvedChannels.map { .object($0.body) })
         }
@@ -437,14 +464,25 @@ public actor WhisperrClient {
         ))
     }
 
-    /// Captures the device push token (FCM registration token / hex APNs token).
+    /// Captures a device push token given as a string: an FCM registration
+    /// token, an Expo push token, a OneSignal subscription id, or an APNs
+    /// token already in hex. For a raw APNs token use
+    /// `setPushToken(_ deviceToken: Data)`; for FCM, `setPushToken(fcmToken:)`.
+    ///
+    /// `kind`, `platform` and `environment` describe the token and are sent
+    /// only when set; the server infers a missing kind from the token.
     ///
     /// With a known user this re-identifies the push channel immediately: a
     /// rotated token opts the previously sent one out, and setting the same
-    /// token again is a no-op (safe to call on every launch or token refresh).
-    /// Called before `identify`, the token is buffered in memory and attached
-    /// to the next identify.
-    public func setPushToken(_ token: String) async throws {
+    /// token again is a no-op (safe to call on every launch or token refresh)
+    /// unless it sets a token field to a new value. Called before `identify`,
+    /// the token is buffered in memory and attached to the next identify.
+    public func setPushToken(
+        _ token: String,
+        kind: WhisperrPushKind? = nil,
+        platform: WhisperrPushPlatform? = nil,
+        environment: WhisperrPushEnvironment? = nil
+    ) async throws {
         try await ensureUsable()
         guard !optedOut else {
             return
@@ -457,27 +495,34 @@ public actor WhisperrClient {
         guard !trimmed.isEmpty else {
             return
         }
+        let entry = WhisperrChannel.push(
+            trimmed,
+            optedIn: true,
+            kind: kind,
+            platform: platform,
+            pushEnvironment: environment
+        )
         guard let userID = currentUserID else {
-            pendingPushToken = trimmed // attached to the next identify()
+            pendingPush = entry // attached to the next identify()
             return
         }
         let last = lastPushUserID == userID ? lastPushToken : nil
-        if last == trimmed {
-            return // refresh storm — token unchanged
+        if last == trimmed, !entry.addsPushMetadata(to: lastPushMetadata) {
+            return // refresh storm — token and its fields unchanged
         }
         var channels: [WhisperrChannel] = []
-        // Rotation: retire the token this client previously registered.
-        if let last {
+        // Rotation: retire the token this client previously registered. The
+        // server matches the opt-out by address, so it carries no token fields.
+        if let last, last != trimmed {
             channels.append(.push(last, optedIn: false))
         }
-        channels.append(.push(trimmed, optedIn: true))
+        channels.append(entry)
         let body: [String: JSONValue] = [
             "external_user_id": .string(userID),
             "channels": .array(channels.map { .object($0.body) })
         ]
-        lastPushUserID = userID
-        lastPushToken = trimmed
-        pendingPushToken = nil
+        rememberPushChannel(userID: userID, channels: channels)
+        pendingPush = nil
         await enqueue(QueuedOperation(
             id: idGenerator(),
             kind: .identify,
@@ -485,11 +530,34 @@ public actor WhisperrClient {
         ))
     }
 
-    /// APNs convenience: hex-encodes the `deviceToken` from
-    /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` and
-    /// forwards it to `setPushToken(_:)`.
+    /// Captures the APNs device token from
+    /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`.
+    /// It sends the token as lowercase hex with `kind: apns`, the platform,
+    /// and the APNs environment. The environment comes from
+    /// `WhisperrPushEnvironment.current` (the provisioning profile, then the
+    /// build) unless you pass one.
+    public func setPushToken(
+        _ deviceToken: Data,
+        environment: WhisperrPushEnvironment? = nil
+    ) async throws {
+        try await setPushToken(
+            deviceToken.whisperrHexString,
+            kind: .apns,
+            platform: WhisperrPushPlatform.current,
+            environment: environment ?? WhisperrPushEnvironment.current
+        )
+    }
+
+    /// Same as `setPushToken(_ deviceToken: Data)`. Kept for 0.3.x callers.
     public func setPushToken(deviceToken: Data) async throws {
-        try await setPushToken(deviceToken.map { String(format: "%02x", $0) }.joined())
+        try await setPushToken(deviceToken, environment: nil)
+    }
+
+    /// Captures a Firebase Cloud Messaging registration token (from
+    /// `Messaging.messaging().token` or `messaging(_:didReceiveRegistrationToken:)`).
+    /// It sends `kind: fcm` and the platform.
+    public func setPushToken(fcmToken: String) async throws {
+        try await setPushToken(fcmToken, kind: .fcm, platform: WhisperrPushPlatform.current)
     }
 
     /// Tracks a product event for the current user, or for `userID` when supplied.
@@ -556,7 +624,7 @@ public actor WhisperrClient {
         }
         var merged = properties
         merged["screen_name"] = .string(trimmed)
-        try await track("screen_viewed", properties: merged)
+        try await track("screen_viewed", properties: withAutomaticProperties(merged))
     }
 
     /// Reports that the user opened a Whisperr push notification: sends
@@ -596,7 +664,7 @@ public actor WhisperrClient {
         defer { pushOpensInFlight.remove(payload.messageID) }
         // Mark the id as sent only after the event is in the persisted queue.
         // If track throws (client closed), the id stays unmarked.
-        try await track("push_opened", properties: properties)
+        try await track("push_opened", properties: withAutomaticProperties(properties))
         openedPushMessageIDs.append(payload.messageID)
         if openedPushMessageIDs.count > Self.maxRememberedPushOpens {
             openedPushMessageIDs.removeFirst(openedPushMessageIDs.count - Self.maxRememberedPushOpens)
@@ -613,6 +681,98 @@ public actor WhisperrClient {
         openedPushMessageIDs.count
     }
 
+    /// Tracks `push_opened` for a Whisperr notification (once per message id)
+    /// and returns its deep link, or nil when the notification is not from
+    /// Whisperr or has no valid link. It never throws: a closed client only
+    /// skips the event.
+    @discardableResult
+    public func handleNotification(_ payload: WhisperrPushPayload) async -> URL? {
+        _ = try? await trackPushOpened(payload)
+        return payload.deepLinkURL
+    }
+
+    /// `userInfo` form of `handleNotification(_:)`.
+    @discardableResult
+    public func handleNotification(userInfo: [AnyHashable: Any]) async -> URL? {
+        guard let payload = WhisperrPushPayload(userInfo: userInfo) else {
+            return nil
+        }
+        return await handleNotification(payload)
+    }
+
+    #if canImport(UserNotifications) && !os(tvOS)
+    /// Call it from `userNotificationCenter(_:didReceive:withCompletionHandler:)`.
+    /// It returns the deep link at once, and sends `push_opened` in the
+    /// background (once per message id). It returns nil, and sends nothing,
+    /// for a notification not sent by Whisperr and for a dismissal.
+    @discardableResult
+    public nonisolated func handleNotificationResponse(_ response: UNNotificationResponse) -> URL? {
+        guard let payload = WhisperrPushPayload(response: response) else {
+            return nil
+        }
+        Task { _ = try? await self.trackPushOpened(payload) }
+        return payload.deepLinkURL
+    }
+    #endif
+
+    // MARK: - Push permission
+
+    /// Reports the notification permission. It sends `push_permission_changed`
+    /// with `status` (and `previous_status`) when the status differs from the
+    /// last one sent from this device, and returns true when it sent.
+    ///
+    /// Call it after `requestAuthorization`, or leave it to the SDK: with
+    /// `automaticPushPermission` (on by default) the SDK reads the permission
+    /// on each move to the foreground.
+    @discardableResult
+    public func pushPermissionChanged(_ status: WhisperrPushPermissionStatus) async -> Bool {
+        guard !closed else {
+            return false
+        }
+        await start()
+        guard !optedOut, lastPushPermission != status.rawValue else {
+            return false
+        }
+        let previous = lastPushPermission
+        // Claim the new status before the first await, so a concurrent call
+        // with the same status cannot send it twice.
+        lastPushPermission = status.rawValue
+        var properties: [String: JSONValue] = ["status": .string(status.rawValue)]
+        if let previous {
+            properties["previous_status"] = .string(previous)
+        }
+        do {
+            // The enqueue persists the claimed status with the event.
+            try await track("push_permission_changed", properties: withAutomaticProperties(properties))
+            return true
+        } catch {
+            if lastPushPermission == status.rawValue {
+                lastPushPermission = previous
+            }
+            return false
+        }
+    }
+
+    /// Reads the notification permission without prompting
+    /// (`UNUserNotificationCenter.getNotificationSettings`) and reports it
+    /// through `pushPermissionChanged(_:)`. Returns the status read, or nil
+    /// where it cannot be read.
+    @discardableResult
+    public func refreshPushPermission() async -> WhisperrPushPermissionStatus? {
+        guard !closed, let status = await pushPermissionProvider() else {
+            return nil
+        }
+        await pushPermissionChanged(status)
+        return status
+    }
+
+    private func refreshPushPermissionIfAutomatic() async {
+        guard options.automaticEvents, options.automaticPushPermission else {
+            return
+        }
+        await refreshPushPermission()
+    }
+
     /// Clears the current user (e.g. on logout) after flushing pending work,
     /// including the persisted identity and last-sent push token pair. The
     /// anonymous handle rotates, so the next person on this device is a new
@@ -620,9 +780,12 @@ public actor WhisperrClient {
     public func reset() async {
         await flush()
         currentUserID = nil
-        pendingPushToken = nil
+        pendingPush = nil
         lastPushToken = nil
         lastPushUserID = nil
+        lastPushMetadata = PushMetadata()
+        // The next user on this device gets a fresh permission report.
+        lastPushPermission = nil
         anonymousID = nil // a new handle is created on the next anonymous event
         await persist()
     }
@@ -814,6 +977,14 @@ public actor WhisperrClient {
         if lastPushUserID == nil, lastPushToken == nil {
             lastPushUserID = state.lastPushUserID
             lastPushToken = state.lastPushToken
+            lastPushMetadata = PushMetadata(
+                kind: state.lastPushKind,
+                platform: state.lastPushPlatform,
+                pushEnvironment: state.lastPushEnvironment
+            )
+        }
+        if lastPushPermission == nil {
+            lastPushPermission = state.pushPermission
         }
         if anonymousID == nil {
             anonymousID = state.anonymousID
@@ -843,7 +1014,11 @@ public actor WhisperrClient {
             optedOut: optedOut ? true : nil,
             appVersion: seenAppVersion,
             appBuild: seenAppBuild,
-            openedPushMessageIDs: openedPushMessageIDs.isEmpty ? nil : openedPushMessageIDs
+            openedPushMessageIDs: openedPushMessageIDs.isEmpty ? nil : openedPushMessageIDs,
+            lastPushKind: lastPushMetadata.kind,
+            lastPushPlatform: lastPushMetadata.platform,
+            lastPushEnvironment: lastPushMetadata.pushEnvironment,
+            pushPermission: lastPushPermission
         )
         do {
             let data = state.isEmpty ? nil : try JSONEncoder.whisperr.encode(state)
@@ -892,11 +1067,17 @@ public actor WhisperrClient {
         return merged
     }
 
-    /// Records the opted-in push channel (if any) that an identify just sent.
+    /// Records the opted-in push channel (if any) that an identify just sent,
+    /// with its token fields. For the same (user, token) the fields merge as
+    /// on the server: a field the entry did not send keeps its value.
     private func rememberPushChannel(userID: String, channels: [WhisperrChannel]) {
         for channel in channels where channel.type == .push && channel.optedIn != false {
+            if lastPushUserID != userID || lastPushToken != channel.address {
+                lastPushMetadata = PushMetadata()
+            }
             lastPushUserID = userID
             lastPushToken = channel.address
+            lastPushMetadata.merge(channel)
         }
     }
 
@@ -925,6 +1106,7 @@ public actor WhisperrClient {
             if carried {
                 lastPushUserID = nil
                 lastPushToken = nil
+                lastPushMetadata = PushMetadata()
                 await persist()
                 return
             }

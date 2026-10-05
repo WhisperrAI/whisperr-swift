@@ -209,13 +209,18 @@ final class AutomaticEventsTests: XCTestCase {
         let events = await transport.sentEvents()
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0]["event_type"], "screen_viewed")
-        XCTAssertEqual(events[0]["properties"], ["screen_name": "Paywall", "variant": "b"])
+        let properties = events[0]["properties"]?.objectValue ?? [:]
+        XCTAssertEqual(properties["screen_name"], "Paywall")
+        XCTAssertEqual(properties["variant"], "b")
+        // Reserved events carry the common properties (automatic.json).
+        XCTAssertEqual(properties["platform"], "ios")
+        XCTAssertEqual(properties["timezone"], "Europe/Berlin")
     }
 
     func testDefaultEnvironmentReportsOSAndPlatform() {
         let environment = AppEnvironment.current()
         XCTAssertFalse(environment.osName.isEmpty)
-        XCTAssertTrue(environment.osVersion.contains("."))
+        XCTAssertTrue(environment.osVersion?.contains(".") ?? false)
         #if os(macOS)
         XCTAssertEqual(environment.platform, "macos")
         XCTAssertEqual(environment.osName, "macos")
@@ -242,10 +247,11 @@ final class PushOpenedTests: XCTestCase {
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0]["event_type"], "push_opened")
         XCTAssertEqual(events[0]["external_user_id"], "user_1")
-        XCTAssertEqual(events[0]["properties"], [
-            "whisperr_message_id": "msg_1",
-            "deep_link": "myapp://streak"
-        ])
+        let properties = events[0]["properties"]?.objectValue ?? [:]
+        XCTAssertEqual(properties["whisperr_message_id"], "msg_1")
+        XCTAssertEqual(properties["deep_link"], "myapp://streak")
+        XCTAssertEqual(properties["sdk_name"], "whisperr-swift")
+        XCTAssertEqual(properties["app_version"], "1.2.0")
     }
 
     func testPushOpenedReadsOneSignalAdditionalData() {
