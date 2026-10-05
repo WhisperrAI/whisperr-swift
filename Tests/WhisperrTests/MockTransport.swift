@@ -94,3 +94,98 @@ func parseFixtureDate(_ value: String) -> Date {
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return formatter.date(from: value)!
 }
+
+/// A client wired for lifecycle tests: a fixed app environment, a settable
+/// clock, and no UIKit observer (tests drive the lifecycle hooks directly).
+func makeLifecycleClient(
+    transport: MockTransport,
+    persistence: WhisperrPersistence? = InMemoryWhisperrPersistence(),
+    automaticEvents: Bool = true,
+    environment: AppEnvironment = .fixture(),
+    clock: TestClock = TestClock(),
+    deviceTraits: @escaping @Sendable () -> [String: JSONValue] = {
+        ["timezone": "Europe/Berlin", "locale": "de-DE"]
+    },
+    sleeper: @escaping @Sendable (TimeInterval) async -> Void = { _ in },
+    maxRetries: Int = 2
+) -> WhisperrClient {
+    let ids = IDSequence()
+    let anonIDs = IDSequence()
+    return WhisperrClient(
+        apiKey: "wrk_test",
+        baseURL: URL(string: "https://api.test")!,
+        options: WhisperrOptions(
+            flushInterval: 0,
+            flushAt: 20,
+            maxRetries: maxRetries,
+            retryBaseDelay: 0,
+            maxRetryDelay: 0,
+            enablePersistence: persistence != nil,
+            automaticEvents: automaticEvents
+        ),
+        persistence: persistence,
+        transport: transport,
+        clock: { clock.now },
+        idGenerator: { ids.next() },
+        sleeper: sleeper,
+        deviceTraits: deviceTraits,
+        appEnvironment: { environment },
+        anonymousIDGenerator: { "anon-" + anonIDs.next() },
+        installsLifecycleObserver: false
+    )
+}
+
+extension AppEnvironment {
+    static func fixture(version: String? = "1.2.0", build: String? = "42") -> AppEnvironment {
+        AppEnvironment(
+            appVersion: version,
+            appBuild: build,
+            osName: "iOS",
+            osVersion: "18.1",
+            platform: "ios"
+        )
+    }
+}
+
+final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = Date(timeIntervalSince1970: 1_780_229_600)
+
+    var now: Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(_ seconds: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        value = value.addingTimeInterval(seconds)
+    }
+}
+
+final class SleepRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [TimeInterval] = []
+
+    func record(_ seconds: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage.append(seconds)
+    }
+
+    var values: [TimeInterval] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+extension MockTransport {
+    /// Every event sent in /v1/events/batch requests, in order.
+    func sentEvents() -> [[String: JSONValue]] {
+        batchBodies().flatMap { body in
+            (body.objectValue?["events"]?.arrayValue ?? []).compactMap(\.objectValue)
+        }
+    }
+}

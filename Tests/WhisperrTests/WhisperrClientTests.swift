@@ -45,12 +45,32 @@ final class WhisperrClientTests: XCTestCase {
 
         let pending = await client.pendingCount
         XCTAssertEqual(pending, 0)
-        do {
-            try await client.track("feature_used")
-            XCTFail("expected missingUserID after reset")
-        } catch let error as WhisperrClientError {
-            XCTAssertEqual(error, .missingUserID)
-        }
+
+        // After logout, events go out under a new anonymous handle instead of
+        // failing.
+        try await client.track("feature_used")
+        await client.flush()
+        let last = await transport.sentEvents().last
+        XCTAssertNil(last?["external_user_id"])
+        XCTAssertNotNil(last?["anonymous_id"])
+    }
+
+    func testIdentifyMovesQueuedAnonymousEventsToTheUser() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport: transport)
+
+        try await client.track("onboarding_started")
+        try await client.identify("user_1")
+        await client.flush()
+
+        let requests = await transport.requests
+        XCTAssertEqual(requests.map(\.path), ["/v1/events/batch", "/v1/identify"])
+        let event = await transport.sentEvents().first
+        XCTAssertEqual(event?["external_user_id"], "user_1")
+        XCTAssertNil(event?["anonymous_id"])
+        // The identify still carries the handle, so the server promotes
+        // anything this device already sent under it.
+        XCTAssertNotNil(requests[1].body.objectValue?["anonymous_id"])
     }
 
     func testAuthRetainsQueueForRecovery() async throws {

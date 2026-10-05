@@ -20,3 +20,6 @@ jobs:
         run: swift test
         env:
           WHISPERR_SPEC_PATH: ${{ github.workspace }}/whisperr-spec/conformance/wire.json
+      - name: Build for iOS
+        # swift test runs on macOS only; this compiles the UIKit code paths.
+        run: xcodebuild -scheme whisperr-swift -destination 'generic/platform=iOS' build CODE_SIGNING_ALLOWED=NO
