@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 This is a minor release (0.4.0). It makes push work end to end on iOS.
 

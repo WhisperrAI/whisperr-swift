@@ -3,7 +3,7 @@ import Foundation
 import UserNotifications
 #endif
 
-public let kWhisperrSdkVersion = "0.3.0"
+public let kWhisperrSdkVersion = "0.4.0"
 public let kWhisperrDefaultBaseURL = URL(string: "https://api.whisperr.net")!
 
 private let eventTypePattern = try! NSRegularExpression(

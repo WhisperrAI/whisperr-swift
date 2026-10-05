@@ -9,7 +9,7 @@ stable event idempotency.
 Add the package in Xcode or Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.3.0")
+.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.4.0")
 ```
 
 ## Quick Start
