@@ -17,7 +17,7 @@ Add the package in Xcode or Swift Package Manager:
 ```swift
 import Whisperr
 
-let whisperr = WhisperrClient(apiKey: "wrk_...")
+let whisperr = WhisperrClient(apiKey: "wpk_...")
 try await whisperr.identify(
     "user_123",
     traits: ["plan": "pro"],
@@ -380,7 +380,7 @@ they enter the queue and are surfaced through `onError`.
 
 - Events send to `POST /v1/events/batch`.
 - Identity updates send to `POST /v1/identify`.
-- Requests use `Authorization: Bearer <wrk_...>`.
+- Requests use `Authorization: Bearer <wpk_...>`.
 - Each event carries a stable `$message_id` in `context` for backend dedup.
 - `401`/`403` retain the queue and surface `auth`.
 - `429`, `5xx`, timeouts, and network failures retry with bounded backoff
@@ -393,7 +393,7 @@ they enter the queue and are surfaced through `onError`.
 
 ```swift
 let whisperr = WhisperrClient(
-    apiKey: "wrk_...",
+    apiKey: "wpk_...",
     options: WhisperrOptions(
         flushInterval: 15,
         flushAt: 20,
