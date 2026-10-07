@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **Permission changes the push token.** A `denied` report (from
+  `pushPermissionChanged(_:)` or the foreground read) sends one identify that
+  opts this device's push token out, and the SDK holds the token. A token set
+  while `denied` is held, not sent. An `authorized` or `provisional` report
+  opts the held token back in. The SDK stores the last reported status; it
+  survives a restart and `reset()`. Before, Swift sent only the event and left
+  the token opted in. This matches React Native and Flutter (whisperr-spec
+  SPEC.md "Push permission and the token").
+- **Opt-out reaches the server.** `optOut()` sends one identify that opts this
+  device's push token out (`opted_in: false`) when a token was registered. It
+  goes under the user the token was registered for. The SDK delivers and
+  retries it like any queued request, also after a restart. Then it sends
+  nothing until `optIn()`. A request that was in flight during `optOut()` and
+  then fails is not retried. Opt-out forgets the last-sent token, so after
+  `optIn()` the next `setPushToken` registers it again. Queued push opt-outs
+  (a rotation, a denied permission, an earlier opt-out) are kept, not
+  discarded. A second
+  `optOut()` while opted out is a no-op.
+- **Older opted-out installs.** A device that opted out on 0.4.x and still has
+  a registered token sends the same opt-out once at start.
+- **Conformance.** The spec runners execute the `push_permission_changed`
+  cases in `automatic.json`, and the opt-out and permission cases in
+  `push.json`.
+
 ## 0.4.0
 
 This is a minor release (0.4.0). It makes push work end to end on iOS.

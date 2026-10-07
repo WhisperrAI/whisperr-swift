@@ -197,3 +197,35 @@ extension MockTransport {
         }
     }
 }
+
+/// Holds one send open until the test releases it, so a test can act while a
+/// request is in flight.
+actor GatedTransport: WhisperrTransport {
+    private(set) var requests: [MockTransport.Request] = []
+    private var holdNext = false
+    private var held: CheckedContinuation<WhisperrSendResult, Never>?
+
+    func holdNextSend() {
+        holdNext = true
+    }
+
+    func send(path: String, body: JSONValue) async -> WhisperrSendResult {
+        requests.append(MockTransport.Request(path: path, body: body))
+        guard holdNext else {
+            return .ok
+        }
+        holdNext = false
+        return await withCheckedContinuation { held = $0 }
+    }
+
+    func waitUntilHolding() async {
+        while held == nil {
+            await Task.yield()
+        }
+    }
+
+    func release(_ result: WhisperrSendResult) {
+        held?.resume(returning: result)
+        held = nil
+    }
+}

@@ -232,8 +232,9 @@ struct QueuedOperation: Codable, Equatable, Sendable {
 /// It also holds the anonymous handle, the opt-out flag, the last app
 /// version seen (for `app_installed` / `app_updated`) and the push message ids
 /// already reported as opened, the token fields (kind, platform, environment)
-/// last delivered with the push token, and the last notification permission
-/// sent. Fields added after 0.2.2 are optional so older state still decodes.
+/// last delivered with the push token, the last notification permission
+/// sent, and the last one reported. Fields added after 0.2.2 are optional so
+/// older state still decodes.
 struct PersistedState: Codable, Equatable, Sendable {
     var queue: [QueuedOperation] = []
     var userID: String?
@@ -248,13 +249,15 @@ struct PersistedState: Codable, Equatable, Sendable {
     var lastPushPlatform: String?
     var lastPushEnvironment: String?
     var pushPermission: String?
+    /// The last permission reported, sent or not; `denied` holds push tokens.
+    var pushPermissionStatus: String?
 
     var isEmpty: Bool {
         queue.isEmpty && userID == nil && lastPushUserID == nil && lastPushToken == nil
             && anonymousID == nil && optedOut != true && appVersion == nil && appBuild == nil
             && (openedPushMessageIDs ?? []).isEmpty
             && lastPushKind == nil && lastPushPlatform == nil && lastPushEnvironment == nil
-            && pushPermission == nil
+            && pushPermission == nil && pushPermissionStatus == nil
     }
 
     enum CodingKeys: String, CodingKey {
@@ -271,6 +274,7 @@ struct PersistedState: Codable, Equatable, Sendable {
         case lastPushPlatform = "last_push_platform"
         case lastPushEnvironment = "last_push_env"
         case pushPermission = "push_permission"
+        case pushPermissionStatus = "push_permission_status"
     }
 }
 

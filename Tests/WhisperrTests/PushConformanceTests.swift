@@ -3,7 +3,8 @@ import XCTest
 
 /// Executes the push-token capture flows pinned in whisperr-spec
 /// conformance/push.json: partial re-identify, rotation opt-out, dedup
-/// (including across restarts), buffer-until-identify, and (kindCases) the
+/// (including across restarts), buffer-until-identify, opt-out, the token
+/// change a denied or re-granted permission causes, and (kindCases) the
 /// optional kind / platform / push_env token fields.
 final class PushConformanceTests: XCTestCase {
     func testPushTokenFlowsMatchSpec() async throws {
@@ -51,6 +52,13 @@ final class PushConformanceTests: XCTestCase {
                         platform: try token.platform.map { try XCTUnwrap(WhisperrPushPlatform(rawValue: $0), testCase.name) },
                         environment: try token.pushEnv.map { try XCTUnwrap(WhisperrPushEnvironment(rawValue: $0), testCase.name) }
                     )
+                } else if step.optOut == true {
+                    await client.optOut()
+                } else if step.optIn == true {
+                    await client.optIn()
+                } else if let raw = step.pushPermission {
+                    let status = try XCTUnwrap(WhisperrPushPermissionStatus(rawValue: raw), testCase.name)
+                    await client.pushPermissionChanged(status)
                 } else if step.reset == true {
                     // Logout: clears the current user and the last-sent pair.
                     await client.reset()

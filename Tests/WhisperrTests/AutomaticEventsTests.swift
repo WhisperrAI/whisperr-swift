@@ -367,6 +367,155 @@ final class OptOutTests: XCTestCase {
         let types = await transport.sentEvents().map { $0["event_type"] }
         XCTAssertEqual(types, ["lesson_completed"])
     }
+
+    func testPushOptOutIsRetriedAfterRestartWhileOptedOut() async throws {
+        let transport = MockTransport()
+        let persistence = InMemoryWhisperrPersistence()
+        let first = makeLifecycleClient(transport: transport, persistence: persistence)
+        try await first.identify("user_1")
+        try await first.setPushToken("tok_a")
+        await first.flush()
+
+        await transport.setResult(.retry)
+        await first.optOut()
+        await first.optOut()
+        await first.close()
+
+        await transport.setResult(.ok)
+        let triedBeforeRestart = await transport.requests.count
+        let second = makeLifecycleClient(transport: transport, persistence: persistence)
+        try await second.track("lesson_completed")
+        await second.flush()
+
+        let optOut: JSONValue = [
+            "external_user_id": "user_1",
+            "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]
+        ]
+        let afterRestart = await transport.requests.dropFirst(triedBeforeRestart)
+        XCTAssertEqual(Array(afterRestart), [MockTransport.Request(path: "/v1/identify", body: optOut)])
+        let pending = await second.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testQueuedRetirementsSurviveOptOut() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport)
+        try await client.identify("user_1")
+        try await client.setPushToken("tok_a")
+        await client.flush()
+
+        await transport.setResult(.retry)
+        try await client.setPushToken("tok_b")
+        try await client.track("lesson_completed")
+        await client.optOut()
+        await client.optIn()
+        await client.optOut()
+        await transport.setResult(.ok)
+        let triedOffline = await transport.requests.count
+        await client.flush()
+
+        let delivered = await transport.requests.dropFirst(triedOffline).map(\.body)
+        XCTAssertEqual(delivered, [
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]],
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_b", "opted_in": false]]]
+        ])
+    }
+
+    func testDataInFlightDuringOptOutIsNotRetried() async throws {
+        let transport = GatedTransport()
+        let client = WhisperrClient(
+            apiKey: "wrk_test",
+            options: WhisperrOptions(flushInterval: 0, maxRetries: 0, automaticEvents: false),
+            persistence: InMemoryWhisperrPersistence(),
+            transport: transport,
+            sleeper: { _ in },
+            deviceTraits: { [:] }
+        )
+        try await client.identify("user_1")
+        try await client.setPushToken("tok_a")
+        await client.flush()
+
+        try await client.track("lesson_completed")
+        await transport.holdNextSend()
+        let inFlight = Task { await client.flush() }
+        await transport.waitUntilHolding()
+        await client.optOut()
+        await transport.release(.retry)
+        await inFlight.value
+        await client.flush()
+
+        let paths = await transport.requests.dropFirst(2).map(\.path)
+        XCTAssertEqual(paths, ["/v1/events/batch", "/v1/identify"], "the failed batch is not sent again after the opt-out")
+        let pending = await client.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testRotationInFlightDuringOptOutStillRetiresTheOldToken() async throws {
+        try await assertRotationInFlightDuringOptOutRetiresTheOldToken(failingWith: .retry)
+        try await assertRotationInFlightDuringOptOutRetiresTheOldToken(failingWith: .drop(400))
+    }
+
+    private func assertRotationInFlightDuringOptOutRetiresTheOldToken(failingWith failure: WhisperrSendResult) async throws {
+        let transport = GatedTransport()
+        let client = WhisperrClient(
+            apiKey: "wrk_test",
+            options: WhisperrOptions(flushInterval: 0, maxRetries: 0, automaticEvents: false),
+            persistence: InMemoryWhisperrPersistence(),
+            transport: transport,
+            sleeper: { _ in },
+            deviceTraits: { [:] }
+        )
+        try await client.identify("user_1")
+        try await client.setPushToken("tok_a")
+        await client.flush()
+
+        await transport.holdNextSend()
+        try await client.setPushToken("tok_b")
+        let inFlight = Task { await client.flush() }
+        await transport.waitUntilHolding()
+        await client.optOut()
+        await transport.release(failure)
+        await inFlight.value
+        await client.flush()
+
+        let afterRotation = await transport.requests.dropFirst(3).map(\.body)
+        XCTAssertEqual(afterRotation, [
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]],
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_b", "opted_in": false]]]
+        ])
+    }
+
+    func testOptedOutInstallFromOlderSDKRetiresItsTokenOnce() async throws {
+        let transport = MockTransport()
+        let persistence = InMemoryWhisperrPersistence()
+        // 0.4.x could put a failed in-flight batch back after the opt-out.
+        let stranded = QueuedOperation(
+            id: "mid-legacy",
+            kind: .track,
+            body: ["event_type": "lesson_completed", "external_user_id": "user_1"]
+        )
+        let legacy = PersistedState(
+            queue: [stranded],
+            userID: "user_1",
+            lastPushUserID: "user_1",
+            lastPushToken: "tok_a",
+            optedOut: true
+        )
+        await persistence.save(try JSONEncoder.whisperr.encode(legacy))
+
+        let first = makeLifecycleClient(transport: transport, persistence: persistence)
+        await first.flush()
+        await first.close()
+        let second = makeLifecycleClient(transport: transport, persistence: persistence)
+        await second.flush()
+
+        let optOut: JSONValue = [
+            "external_user_id": "user_1",
+            "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]
+        ]
+        let requests = await transport.requests
+        XCTAssertEqual(requests, [MockTransport.Request(path: "/v1/identify", body: optOut)])
+    }
 }
 
 final class RetryAfterTests: XCTestCase {

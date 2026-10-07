@@ -23,7 +23,9 @@ public actor WhisperrClient {
 
     private var queue: [QueuedOperation] = []
     private var currentUserID: String?
-    /// Push entry captured before identify(); attached to the next identify.
+    /// Push entry captured before identify() (attached to the next identify),
+    /// or held while the reported permission is denied (sent when it comes
+    /// back). In memory only.
     private var pendingPush: WhisperrChannel?
     /// Last push token delivered and for which user — dedups refresh storms and
     /// lets a rotation opt the previous token out. Persisted (with the identity)
@@ -37,6 +39,10 @@ public actor WhisperrClient {
     /// The last notification permission sent as push_permission_changed.
     /// Persisted; reset() clears it.
     private var lastPushPermission: String?
+    /// The last notification permission reported on this device, sent or
+    /// not. While it is denied, push tokens are held in `pendingPush`.
+    /// Persisted, and kept across reset(): the permission is the device's.
+    private var pushPermissionStatus: String?
     private let pushPermissionProvider: @Sendable () async -> WhisperrPushPermissionStatus?
     /// The device's anonymous handle (whisperr-spec SPEC.md → Anonymous
     /// visitors). Created on first use by a track before identify, carried by
@@ -208,16 +214,49 @@ public actor WhisperrClient {
     }
 
     /// Stops all collection: nothing is queued or sent until `optIn()`. Work
-    /// already queued is discarded. The choice is persisted. This is local to
-    /// the device; it does not delete data already sent.
+    /// already queued is discarded. The choice is persisted.
+    ///
+    /// When this device registered a push token, the SDK first sends one
+    /// identify that opts that token out, under the user it was registered
+    /// for, so the server stops sending push to this device. Other channels
+    /// and the user's other devices are not changed, and data already sent is
+    /// not deleted. After `optIn()`, the next `setPushToken` registers the
+    /// token again.
     public func optOut() async {
         await start()
+        guard !optedOut else {
+            return
+        }
         optedOut = true
-        let discarded = queue
-        queue.removeAll()
+        let pushOptOut = takePushOptOut()
+        queue = queue.compactMap(\.pushRetirements) + (pushOptOut.map { [$0] } ?? [])
         pendingPush = nil
-        await forgetPushMark(discarded)
         await persist()
+        if pushOptOut != nil {
+            Task { await self.flush() }
+        }
+    }
+
+    /// The identify that opts this device's last-sent push token out, under
+    /// the user it was sent for. Forgets the pair, so the token registers
+    /// again after `optIn()`.
+    private func takePushOptOut() -> QueuedOperation? {
+        defer {
+            lastPushToken = nil
+            lastPushUserID = nil
+            lastPushMetadata = PushMetadata()
+        }
+        guard let userID = lastPushUserID, let token = lastPushToken else {
+            return nil
+        }
+        return QueuedOperation(
+            id: idGenerator(),
+            kind: .identify,
+            body: [
+                "external_user_id": .string(userID),
+                "channels": .array([.object(WhisperrChannel.push(token, optedIn: false).body)])
+            ]
+        )
     }
 
     /// Resumes collection after `optOut()`.
@@ -434,8 +473,11 @@ public actor WhisperrClient {
         // A token buffered by setPushToken() rides along unless the caller
         // supplied its own push channel — or it matches the (restored)
         // last-sent pair for this user with no new token fields, in which
-        // case there is nothing new to send.
-        if let pending = pendingPush,
+        // case there is nothing new to send. While notifications are denied
+        // the token stays held.
+        let holdsPush = pushPermissionDenied
+        if !holdsPush,
+           let pending = pendingPush,
            !resolvedChannels.contains(where: { $0.type == .push }),
            !(lastPushUserID == id && lastPushToken == pending.address
                && !pending.addsPushMetadata(to: lastPushMetadata)) {
@@ -452,7 +494,9 @@ public actor WhisperrClient {
             resolvedChannels.insert(.push(last, optedIn: false), at: 0)
         }
         rememberPushChannel(userID: id, channels: resolvedChannels)
-        pendingPush = nil
+        if !holdsPush {
+            pendingPush = nil
+        }
         if !resolvedChannels.isEmpty {
             body["channels"] = .array(resolvedChannels.map { .object($0.body) })
         }
@@ -477,6 +521,8 @@ public actor WhisperrClient {
     /// token again is a no-op (safe to call on every launch or token refresh)
     /// unless it sets a token field to a new value. Called before `identify`,
     /// the token is buffered in memory and attached to the next identify.
+    /// While the reported permission is `denied`, the token is held and sent
+    /// when the permission is `authorized` or `provisional` again.
     public func setPushToken(
         _ token: String,
         kind: WhisperrPushKind? = nil,
@@ -502,8 +548,10 @@ public actor WhisperrClient {
             platform: platform,
             pushEnvironment: environment
         )
-        guard let userID = currentUserID else {
-            pendingPush = entry // attached to the next identify()
+        guard let userID = currentUserID, !pushPermissionDenied else {
+            // Attached to the next identify(), or sent when the permission
+            // comes back.
+            pendingPush = entry
             return
         }
         let last = lastPushUserID == userID ? lastPushToken : nil
@@ -721,6 +769,10 @@ public actor WhisperrClient {
     /// with `status` (and `previous_status`) when the status differs from the
     /// last one sent from this device, and returns true when it sent.
     ///
+    /// `denied` also opts this device's push token out and holds it, so the
+    /// server stops sending push to this device. `authorized` or
+    /// `provisional` opts the held token back in.
+    ///
     /// Call it after `requestAuthorization`, or leave it to the SDK: with
     /// `automaticPushPermission` (on by default) the SDK reads the permission
     /// on each move to the foreground.
@@ -730,7 +782,17 @@ public actor WhisperrClient {
             return false
         }
         await start()
-        guard !optedOut, lastPushPermission != status.rawValue else {
+        guard !optedOut else {
+            return false
+        }
+        let statusChanged = pushPermissionStatus != status.rawValue
+        let pushUpdate = applyPushPermission(status)
+        guard lastPushPermission != status.rawValue else {
+            if let pushUpdate {
+                await enqueue(pushUpdate)
+            } else if statusChanged {
+                await persist()
+            }
             return false
         }
         let previous = lastPushPermission
@@ -741,16 +803,84 @@ public actor WhisperrClient {
         if let previous {
             properties["previous_status"] = .string(previous)
         }
+        var sent = true
         do {
             // The enqueue persists the claimed status with the event.
             try await track("push_permission_changed", properties: withAutomaticProperties(properties))
-            return true
         } catch {
             if lastPushPermission == status.rawValue {
                 lastPushPermission = previous
             }
-            return false
+            sent = false
         }
+        if let pushUpdate {
+            await enqueue(pushUpdate)
+        } else if !sent {
+            await persist()
+        }
+        return sent
+    }
+
+    private var pushPermissionDenied: Bool {
+        pushPermissionStatus == WhisperrPushPermissionStatus.denied.rawValue
+    }
+
+    /// Records the reported permission and returns the push channel change it
+    /// causes for the current user (whisperr-spec SPEC.md "Push permission and
+    /// the token"): `denied` opts the last-sent token out, forgets the pair and
+    /// holds the token; `authorized` or `provisional` opts a held token in.
+    /// Runs before any await, so concurrent reports see a consistent pair.
+    private func applyPushPermission(_ status: WhisperrPushPermissionStatus) -> QueuedOperation? {
+        pushPermissionStatus = status.rawValue
+        guard let userID = currentUserID else {
+            return nil // identify() decides what a buffered token does
+        }
+        let last = lastPushUserID == userID ? lastPushToken : nil
+        let channels: [WhisperrChannel]
+        switch status {
+        case .denied:
+            guard let last else {
+                return nil
+            }
+            if pendingPush == nil {
+                pendingPush = .push(
+                    last,
+                    optedIn: true,
+                    kind: lastPushMetadata.kind.flatMap(WhisperrPushKind.init(rawValue:)),
+                    platform: lastPushMetadata.platform.flatMap(WhisperrPushPlatform.init(rawValue:)),
+                    pushEnvironment: lastPushMetadata.pushEnvironment.flatMap(WhisperrPushEnvironment.init(rawValue:))
+                )
+            }
+            lastPushToken = nil
+            lastPushUserID = nil
+            lastPushMetadata = PushMetadata()
+            channels = [.push(last, optedIn: false)]
+        case .authorized, .provisional:
+            guard let held = pendingPush else {
+                return nil
+            }
+            pendingPush = nil
+            if last == held.address, !held.addsPushMetadata(to: lastPushMetadata) {
+                return nil
+            }
+            var registration: [WhisperrChannel] = []
+            if let last, last != held.address {
+                registration.append(.push(last, optedIn: false))
+            }
+            registration.append(held)
+            rememberPushChannel(userID: userID, channels: registration)
+            channels = registration
+        case .notDetermined:
+            return nil
+        }
+        return QueuedOperation(
+            id: idGenerator(),
+            kind: .identify,
+            body: [
+                "external_user_id": .string(userID),
+                "channels": .array(channels.map { .object($0.body) })
+            ]
+        )
     }
 
     /// Reads the notification permission without prompting
@@ -834,7 +964,15 @@ public actor WhisperrClient {
     private func drain() async {
         while !queue.isEmpty {
             let batch = takeNextBatch()
+            let takenWhileOptedOut = optedOut
             let outcome = await deliver(batch)
+            // optOut() ran while this batch was in flight and it failed: keep
+            // only its push opt-outs, as optOut() does for the queue.
+            if optedOut, !takenWhileOptedOut, outcome.failed {
+                queue.insert(contentsOf: batch.compactMap(\.pushRetirements), at: 0)
+                await persist()
+                continue
+            }
 
             switch outcome {
             case .ok:
@@ -986,6 +1124,9 @@ public actor WhisperrClient {
         if lastPushPermission == nil {
             lastPushPermission = state.pushPermission
         }
+        if pushPermissionStatus == nil {
+            pushPermissionStatus = state.pushPermissionStatus
+        }
         if anonymousID == nil {
             anonymousID = state.anonymousID
         }
@@ -998,6 +1139,12 @@ public actor WhisperrClient {
         }
         if openedPushMessageIDs.isEmpty {
             openedPushMessageIDs = state.openedPushMessageIDs ?? []
+        }
+        // 0.4.x opted out locally only: it could keep the last-sent pair, and
+        // a failed in-flight batch could land back in its queue.
+        if optedOut {
+            queue = queue.compactMap(\.pushRetirements) + (takePushOptOut().map { [$0] } ?? [])
+            await persist()
         }
     }
 
@@ -1018,7 +1165,8 @@ public actor WhisperrClient {
             lastPushKind: lastPushMetadata.kind,
             lastPushPlatform: lastPushMetadata.platform,
             lastPushEnvironment: lastPushMetadata.pushEnvironment,
-            pushPermission: lastPushPermission
+            pushPermission: lastPushPermission,
+            pushPermissionStatus: pushPermissionStatus
         )
         do {
             let data = state.isEmpty ? nil : try JSONEncoder.whisperr.encode(state)
@@ -1149,6 +1297,13 @@ private enum DeliveryOutcome {
     case drop(Int?)
     case auth(Int?)
     case retryExhausted(Int?)
+
+    var failed: Bool {
+        if case .ok = self {
+            return false
+        }
+        return true
+    }
 }
 
 private let timestampFormatter: DateFormatter = {
@@ -1177,5 +1332,31 @@ extension JSONEncoder {
 extension JSONDecoder {
     static var whisperr: JSONDecoder {
         JSONDecoder()
+    }
+}
+
+private extension QueuedOperation {
+    /// This identify cut down to its push opt-outs (a rotation, a denied
+    /// permission, an earlier opt-out), or nil when it retires no token.
+    var pushRetirements: QueuedOperation? {
+        guard kind == .identify,
+              let user = body["external_user_id"],
+              case .array(let channels)? = body["channels"] else {
+            return nil
+        }
+        let retired = channels.filter { channel in
+            guard case .object(let fields) = channel else {
+                return false
+            }
+            return fields["channel"] == .string("push") && fields["opted_in"] == .bool(false)
+        }
+        guard !retired.isEmpty else {
+            return nil
+        }
+        return QueuedOperation(
+            id: id,
+            kind: .identify,
+            body: ["external_user_id": user, "channels": .array(retired)]
+        )
     }
 }

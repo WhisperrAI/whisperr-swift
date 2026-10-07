@@ -177,6 +177,13 @@ the event only when the status changed since the last one it sent from this
 device. A user who turns off notifications is a churn signal, and Whisperr
 then picks another channel.
 
+`denied` also opts this device's push token out on the server, so Whisperr
+stops sending push to this device. The SDK holds the token while the status is
+`denied`. When the status is `authorized` or `provisional` again, the SDK opts
+the token back in. If the token was the user's only opted-in channel, the
+server suppresses the user (`all_channels_opted_out`) until a channel is opted
+in again.
+
 By default the SDK reads the status each time the app comes to the
 foreground. It uses `getNotificationSettings`, which never shows a prompt.
 After your own prompt, report the answer at once:
@@ -423,8 +430,12 @@ await whisperr.optIn()    // collection resumes
 let optedOut = await whisperr.isOptedOut
 ```
 
-The choice is persisted and survives `reset()`. Opt-out is local to the device:
-it does not delete data the server already has.
+The choice is persisted and survives `reset()`. When this device registered a
+push token, `optOut()` first sends one identify
+that opts this device's token out, so Whisperr stops sending push here. Email,
+SMS, and the user's other devices keep their state, and data the server already
+has is not deleted. After `optIn()`, the next `setPushToken` registers the token
+again.
 
 ## Privacy manifest
 
