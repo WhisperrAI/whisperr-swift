@@ -871,7 +871,7 @@ public actor WhisperrClient {
             let outcome = await deliver(batch)
             // optOut() ran while this batch was in flight and it failed: keep
             // only its push opt-outs, as optOut() does for the queue.
-            if optedOut, !takenWhileOptedOut, outcome.retainsBatch {
+            if optedOut, !takenWhileOptedOut, outcome.failed {
                 queue.insert(contentsOf: batch.compactMap(\.pushRetirements), at: 0)
                 await persist()
                 continue
@@ -1197,13 +1197,11 @@ private enum DeliveryOutcome {
     case auth(Int?)
     case retryExhausted(Int?)
 
-    var retainsBatch: Bool {
-        switch self {
-        case .auth, .retryExhausted:
-            return true
-        case .ok, .drop:
+    var failed: Bool {
+        if case .ok = self {
             return false
         }
+        return true
     }
 }
 

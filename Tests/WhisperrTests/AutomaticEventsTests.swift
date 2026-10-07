@@ -451,6 +451,11 @@ final class OptOutTests: XCTestCase {
     }
 
     func testRotationInFlightDuringOptOutStillRetiresTheOldToken() async throws {
+        try await assertRotationInFlightDuringOptOutRetiresTheOldToken(failingWith: .retry)
+        try await assertRotationInFlightDuringOptOutRetiresTheOldToken(failingWith: .drop(400))
+    }
+
+    private func assertRotationInFlightDuringOptOutRetiresTheOldToken(failingWith failure: WhisperrSendResult) async throws {
         let transport = GatedTransport()
         let client = WhisperrClient(
             apiKey: "wrk_test",
@@ -469,7 +474,7 @@ final class OptOutTests: XCTestCase {
         let inFlight = Task { await client.flush() }
         await transport.waitUntilHolding()
         await client.optOut()
-        await transport.release(.retry)
+        await transport.release(failure)
         await inFlight.value
         await client.flush()
 
