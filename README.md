@@ -423,8 +423,8 @@ await whisperr.optIn()    // collection resumes
 let optedOut = await whisperr.isOptedOut
 ```
 
-The choice is persisted and survives `reset()`. When a user is known and this
-device registered a push token for them, `optOut()` first sends one identify
+The choice is persisted and survives `reset()`. When this device registered a
+push token, `optOut()` first sends one identify
 that opts this device's token out, so Whisperr stops sending push here. Email,
 SMS, and the user's other devices keep their state, and data the server already
 has is not deleted. After `optIn()`, the next `setPushToken` registers the token

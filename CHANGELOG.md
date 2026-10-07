@@ -3,11 +3,15 @@
 ## Unreleased
 
 - **Opt-out reaches the server.** `optOut()` sends one identify that opts this
-  device's push token out (`opted_in: false`) when a user is known and the
-  token was registered. The SDK delivers and retries it like any queued request,
-  also after a restart. Then it sends nothing until `optIn()`. Opt-out forgets
-  the last-sent token, so after `optIn()` the next `setPushToken` registers it
-  again. A second `optOut()` is a no-op.
+  device's push token out (`opted_in: false`) when a token was registered. It
+  goes under the user the token was registered for. The SDK delivers and
+  retries it like any queued request, also after a restart. Then it sends
+  nothing until `optIn()`. A request that was in flight during `optOut()` and
+  then fails is not retried. Opt-out forgets the last-sent token, so after
+  `optIn()` the next `setPushToken` registers it again. A second `optOut()` is
+  a no-op.
+- **Older opted-out installs.** A device that opted out on 0.4.x and still has
+  a registered token sends the same opt-out once at start.
 - **Conformance.** The spec runners execute the new `push_permission_changed`
   cases in `automatic.json` and the opt-out cases in `push.json`.
 

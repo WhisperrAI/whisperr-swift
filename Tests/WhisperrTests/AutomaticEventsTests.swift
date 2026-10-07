@@ -396,6 +396,55 @@ final class OptOutTests: XCTestCase {
         let pending = await second.pendingCount
         XCTAssertEqual(pending, 0)
     }
+
+    func testDataInFlightDuringOptOutIsNotRetried() async throws {
+        let transport = GatedTransport()
+        let client = WhisperrClient(
+            apiKey: "wrk_test",
+            options: WhisperrOptions(flushInterval: 0, maxRetries: 0, automaticEvents: false),
+            persistence: InMemoryWhisperrPersistence(),
+            transport: transport,
+            sleeper: { _ in },
+            deviceTraits: { [:] }
+        )
+        try await client.identify("user_1")
+        try await client.setPushToken("tok_a")
+        await client.flush()
+
+        try await client.track("lesson_completed")
+        await transport.holdNextSend()
+        let inFlight = Task { await client.flush() }
+        await transport.waitUntilHolding()
+        await client.optOut()
+        await transport.release(.retry)
+        await inFlight.value
+        await client.flush()
+
+        let paths = await transport.requests.dropFirst(2).map(\.path)
+        XCTAssertEqual(paths, ["/v1/events/batch", "/v1/identify"], "the failed batch is not sent again after the opt-out")
+        let pending = await client.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testOptedOutInstallFromOlderSDKRetiresItsTokenOnce() async throws {
+        let transport = MockTransport()
+        let persistence = InMemoryWhisperrPersistence()
+        let legacy = PersistedState(userID: "user_1", lastPushUserID: "user_1", lastPushToken: "tok_a", optedOut: true)
+        await persistence.save(try JSONEncoder.whisperr.encode(legacy))
+
+        let first = makeLifecycleClient(transport: transport, persistence: persistence)
+        await first.flush()
+        await first.close()
+        let second = makeLifecycleClient(transport: transport, persistence: persistence)
+        await second.flush()
+
+        let optOut: JSONValue = [
+            "external_user_id": "user_1",
+            "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]
+        ]
+        let requests = await transport.requests
+        XCTAssertEqual(requests, [MockTransport.Request(path: "/v1/identify", body: optOut)])
+    }
 }
 
 final class RetryAfterTests: XCTestCase {

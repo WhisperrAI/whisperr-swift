@@ -210,38 +210,47 @@ public actor WhisperrClient {
     /// Stops all collection: nothing is queued or sent until `optIn()`. Work
     /// already queued is discarded. The choice is persisted.
     ///
-    /// When a user is known and this device registered a push token for
-    /// them, the SDK first sends one identify that opts that token out, so
-    /// the server stops sending push to this device. Other channels and the
-    /// user's other devices are not changed, and data already sent is not
-    /// deleted. After `optIn()`, the next `setPushToken` registers the token
-    /// again.
+    /// When this device registered a push token, the SDK first sends one
+    /// identify that opts that token out, under the user it was registered
+    /// for, so the server stops sending push to this device. Other channels
+    /// and the user's other devices are not changed, and data already sent is
+    /// not deleted. After `optIn()`, the next `setPushToken` registers the
+    /// token again.
     public func optOut() async {
         await start()
         guard !optedOut else {
             return
         }
-        var pushOptOut: QueuedOperation?
-        if let userID = currentUserID, lastPushUserID == userID, let token = lastPushToken {
-            pushOptOut = QueuedOperation(
-                id: idGenerator(),
-                kind: .identify,
-                body: [
-                    "external_user_id": .string(userID),
-                    "channels": .array([.object(WhisperrChannel.push(token, optedIn: false).body)])
-                ]
-            )
-        }
         optedOut = true
+        let pushOptOut = takePushOptOut()
         queue = pushOptOut.map { [$0] } ?? []
         pendingPush = nil
-        lastPushToken = nil
-        lastPushUserID = nil
-        lastPushMetadata = PushMetadata()
         await persist()
         if pushOptOut != nil {
-            await flush()
+            Task { await self.flush() }
         }
+    }
+
+    /// The identify that opts this device's last-sent push token out, under
+    /// the user it was sent for. Forgets the pair, so the token registers
+    /// again after `optIn()`.
+    private func takePushOptOut() -> QueuedOperation? {
+        defer {
+            lastPushToken = nil
+            lastPushUserID = nil
+            lastPushMetadata = PushMetadata()
+        }
+        guard let userID = lastPushUserID, let token = lastPushToken else {
+            return nil
+        }
+        return QueuedOperation(
+            id: idGenerator(),
+            kind: .identify,
+            body: [
+                "external_user_id": .string(userID),
+                "channels": .array([.object(WhisperrChannel.push(token, optedIn: false).body)])
+            ]
+        )
     }
 
     /// Resumes collection after `optOut()`.
@@ -858,7 +867,14 @@ public actor WhisperrClient {
     private func drain() async {
         while !queue.isEmpty {
             let batch = takeNextBatch()
+            let takenWhileOptedOut = optedOut
             let outcome = await deliver(batch)
+            // optOut() ran while this batch was in flight: it was user data
+            // queued before the opt-out, so a failed send is not retried.
+            if optedOut, !takenWhileOptedOut, outcome.retainsBatch {
+                await persist()
+                continue
+            }
 
             switch outcome {
             case .ok:
@@ -1023,6 +1039,11 @@ public actor WhisperrClient {
         if openedPushMessageIDs.isEmpty {
             openedPushMessageIDs = state.openedPushMessageIDs ?? []
         }
+        // 0.4.x opted out locally only and could keep the last-sent pair.
+        if optedOut, let pushOptOut = takePushOptOut() {
+            queue.append(pushOptOut)
+            await persist()
+        }
     }
 
     private func persist() async {
@@ -1173,6 +1194,15 @@ private enum DeliveryOutcome {
     case drop(Int?)
     case auth(Int?)
     case retryExhausted(Int?)
+
+    var retainsBatch: Bool {
+        switch self {
+        case .auth, .retryExhausted:
+            return true
+        case .ok, .drop:
+            return false
+        }
+    }
 }
 
 private let timestampFormatter: DateFormatter = {
