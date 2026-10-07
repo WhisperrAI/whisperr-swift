@@ -102,6 +102,30 @@ final class PushPermissionTests: XCTestCase {
         XCTAssertNil(events[1]["properties"]?.objectValue?["previous_status"])
     }
 
+    func testDeniedHoldsTokensAcrossResetUntilThePermissionReturns() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport: transport)
+        try await client.identify("user_1")
+        try await client.setPushToken("fcm_tok_a")
+        await client.pushPermissionChanged(.denied)
+        await client.reset()
+        try await client.identify("user_2")
+        try await client.setPushToken("fcm_tok_b")
+        await client.flush()
+        let beforeRegrant = await transport.requests.filter { $0.path == "/v1/identify" }.count
+        await client.pushPermissionChanged(.authorized)
+        await client.flush()
+
+        let identifies = await transport.requests.filter { $0.path == "/v1/identify" }.map(\.body)
+        XCTAssertEqual(beforeRegrant, 4, "the token set while denied must not be sent")
+        XCTAssertEqual(identifies.last, .object([
+            "external_user_id": "user_2",
+            "channels": .array([.object([
+                "channel": "push", "address": "fcm_tok_b", "opted_in": true
+            ])])
+        ]))
+    }
+
     func testOptedOutSendsNothingAndKeepsTheStoredStatus() async throws {
         let transport = MockTransport()
         let client = makeLifecycleClient(transport: transport)
