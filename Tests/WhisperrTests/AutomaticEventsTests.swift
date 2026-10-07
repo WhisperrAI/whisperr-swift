@@ -488,7 +488,19 @@ final class OptOutTests: XCTestCase {
     func testOptedOutInstallFromOlderSDKRetiresItsTokenOnce() async throws {
         let transport = MockTransport()
         let persistence = InMemoryWhisperrPersistence()
-        let legacy = PersistedState(userID: "user_1", lastPushUserID: "user_1", lastPushToken: "tok_a", optedOut: true)
+        // 0.4.x could put a failed in-flight batch back after the opt-out.
+        let stranded = QueuedOperation(
+            id: "mid-legacy",
+            kind: .track,
+            body: ["event_type": "lesson_completed", "external_user_id": "user_1"]
+        )
+        let legacy = PersistedState(
+            queue: [stranded],
+            userID: "user_1",
+            lastPushUserID: "user_1",
+            lastPushToken: "tok_a",
+            optedOut: true
+        )
         await persistence.save(try JSONEncoder.whisperr.encode(legacy))
 
         let first = makeLifecycleClient(transport: transport, persistence: persistence)
