@@ -869,9 +869,10 @@ public actor WhisperrClient {
             let batch = takeNextBatch()
             let takenWhileOptedOut = optedOut
             let outcome = await deliver(batch)
-            // optOut() ran while this batch was in flight: it was user data
-            // queued before the opt-out, so a failed send is not retried.
+            // optOut() ran while this batch was in flight and it failed: keep
+            // only its push opt-outs, as optOut() does for the queue.
             if optedOut, !takenWhileOptedOut, outcome.retainsBatch {
+                queue.insert(contentsOf: batch.compactMap(\.pushRetirements), at: 0)
                 await persist()
                 continue
             }
@@ -1039,9 +1040,10 @@ public actor WhisperrClient {
         if openedPushMessageIDs.isEmpty {
             openedPushMessageIDs = state.openedPushMessageIDs ?? []
         }
-        // 0.4.x opted out locally only and could keep the last-sent pair.
-        if optedOut, let pushOptOut = takePushOptOut() {
-            queue.append(pushOptOut)
+        // 0.4.x opted out locally only: it could keep the last-sent pair, and
+        // a failed in-flight batch could land back in its queue.
+        if optedOut {
+            queue = queue.compactMap(\.pushRetirements) + (takePushOptOut().map { [$0] } ?? [])
             await persist()
         }
     }

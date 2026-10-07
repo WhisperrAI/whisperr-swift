@@ -450,6 +450,36 @@ final class OptOutTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
+    func testRotationInFlightDuringOptOutStillRetiresTheOldToken() async throws {
+        let transport = GatedTransport()
+        let client = WhisperrClient(
+            apiKey: "wrk_test",
+            options: WhisperrOptions(flushInterval: 0, maxRetries: 0, automaticEvents: false),
+            persistence: InMemoryWhisperrPersistence(),
+            transport: transport,
+            sleeper: { _ in },
+            deviceTraits: { [:] }
+        )
+        try await client.identify("user_1")
+        try await client.setPushToken("tok_a")
+        await client.flush()
+
+        await transport.holdNextSend()
+        try await client.setPushToken("tok_b")
+        let inFlight = Task { await client.flush() }
+        await transport.waitUntilHolding()
+        await client.optOut()
+        await transport.release(.retry)
+        await inFlight.value
+        await client.flush()
+
+        let afterRotation = await transport.requests.dropFirst(3).map(\.body)
+        XCTAssertEqual(afterRotation, [
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]],
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_b", "opted_in": false]]]
+        ])
+    }
+
     func testOptedOutInstallFromOlderSDKRetiresItsTokenOnce() async throws {
         let transport = MockTransport()
         let persistence = InMemoryWhisperrPersistence()
