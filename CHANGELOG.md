@@ -8,8 +8,9 @@
   retries it like any queued request, also after a restart. Then it sends
   nothing until `optIn()`. A request that was in flight during `optOut()` and
   then fails is not retried. Opt-out forgets the last-sent token, so after
-  `optIn()` the next `setPushToken` registers it again. A second `optOut()` is
-  a no-op.
+  `optIn()` the next `setPushToken` registers it again. Queued push opt-outs
+  (a rotation, an earlier opt-out) are kept, not discarded. A second
+  `optOut()` while opted out is a no-op.
 - **Older opted-out installs.** A device that opted out on 0.4.x and still has
   a registered token sends the same opt-out once at start.
 - **Conformance.** The spec runners execute the new `push_permission_changed`

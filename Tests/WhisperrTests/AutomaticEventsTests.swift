@@ -397,6 +397,30 @@ final class OptOutTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
+    func testQueuedRetirementsSurviveOptOut() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport)
+        try await client.identify("user_1")
+        try await client.setPushToken("tok_a")
+        await client.flush()
+
+        await transport.setResult(.retry)
+        try await client.setPushToken("tok_b")
+        try await client.track("lesson_completed")
+        await client.optOut()
+        await client.optIn()
+        await client.optOut()
+        await transport.setResult(.ok)
+        let triedOffline = await transport.requests.count
+        await client.flush()
+
+        let delivered = await transport.requests.dropFirst(triedOffline).map(\.body)
+        XCTAssertEqual(delivered, [
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]],
+            ["external_user_id": "user_1", "channels": [["channel": "push", "address": "tok_b", "opted_in": false]]]
+        ])
+    }
+
     func testDataInFlightDuringOptOutIsNotRetried() async throws {
         let transport = GatedTransport()
         let client = WhisperrClient(

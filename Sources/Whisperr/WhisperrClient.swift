@@ -223,7 +223,7 @@ public actor WhisperrClient {
         }
         optedOut = true
         let pushOptOut = takePushOptOut()
-        queue = pushOptOut.map { [$0] } ?? []
+        queue = queue.compactMap(\.pushRetirements) + (pushOptOut.map { [$0] } ?? [])
         pendingPush = nil
         await persist()
         if pushOptOut != nil {
@@ -1231,5 +1231,31 @@ extension JSONEncoder {
 extension JSONDecoder {
     static var whisperr: JSONDecoder {
         JSONDecoder()
+    }
+}
+
+private extension QueuedOperation {
+    /// This identify cut down to its push opt-outs (a rotation, a denied
+    /// permission, an earlier opt-out), or nil when it retires no token.
+    var pushRetirements: QueuedOperation? {
+        guard kind == .identify,
+              let user = body["external_user_id"],
+              case .array(let channels)? = body["channels"] else {
+            return nil
+        }
+        let retired = channels.filter { channel in
+            guard case .object(let fields) = channel else {
+                return false
+            }
+            return fields["channel"] == .string("push") && fields["opted_in"] == .bool(false)
+        }
+        guard !retired.isEmpty else {
+            return nil
+        }
+        return QueuedOperation(
+            id: id,
+            kind: .identify,
+            body: ["external_user_id": user, "channels": .array(retired)]
+        )
     }
 }
