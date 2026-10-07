@@ -51,6 +51,10 @@ final class PushConformanceTests: XCTestCase {
                         platform: try token.platform.map { try XCTUnwrap(WhisperrPushPlatform(rawValue: $0), testCase.name) },
                         environment: try token.pushEnv.map { try XCTUnwrap(WhisperrPushEnvironment(rawValue: $0), testCase.name) }
                     )
+                } else if step.optOut == true {
+                    await client.optOut()
+                } else if step.optIn == true {
+                    await client.optIn()
                 } else if step.reset == true {
                     // Logout: clears the current user and the last-sent pair.
                     await client.reset()

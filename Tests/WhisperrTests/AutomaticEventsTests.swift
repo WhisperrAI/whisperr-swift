@@ -367,6 +367,35 @@ final class OptOutTests: XCTestCase {
         let types = await transport.sentEvents().map { $0["event_type"] }
         XCTAssertEqual(types, ["lesson_completed"])
     }
+
+    func testPushOptOutIsRetriedAfterRestartWhileOptedOut() async throws {
+        let transport = MockTransport()
+        let persistence = InMemoryWhisperrPersistence()
+        let first = makeLifecycleClient(transport: transport, persistence: persistence)
+        try await first.identify("user_1")
+        try await first.setPushToken("tok_a")
+        await first.flush()
+
+        await transport.setResult(.retry)
+        await first.optOut()
+        await first.optOut()
+        await first.close()
+
+        await transport.setResult(.ok)
+        let triedBeforeRestart = await transport.requests.count
+        let second = makeLifecycleClient(transport: transport, persistence: persistence)
+        try await second.track("lesson_completed")
+        await second.flush()
+
+        let optOut: JSONValue = [
+            "external_user_id": "user_1",
+            "channels": [["channel": "push", "address": "tok_a", "opted_in": false]]
+        ]
+        let afterRestart = await transport.requests.dropFirst(triedBeforeRestart)
+        XCTAssertEqual(Array(afterRestart), [MockTransport.Request(path: "/v1/identify", body: optOut)])
+        let pending = await second.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
 }
 
 final class RetryAfterTests: XCTestCase {

@@ -52,13 +52,11 @@ final class AutomaticConformanceTests: XCTestCase {
         let reserved = Set(spec.reserved.map(\.name))
         let sent = [
             "app_installed", "app_updated", "app_opened", "app_backgrounded",
-            "screen_viewed", "push_opened"
+            "screen_viewed", "push_opened", "push_permission_changed"
         ]
         for name in sent {
             XCTAssertTrue(reserved.contains(name), name)
         }
-        // push_permission_changed is reserved by whisperr-spec#11. It is not
-        // asserted here, so CI stays green against a spec main that predates it.
     }
 
     private func run(_ testCase: AutomaticCase) async throws {
@@ -123,6 +121,15 @@ final class AutomaticConformanceTests: XCTestCase {
                     out[pair.key] = pair.value.stringValue ?? ""
                 }
                 _ = await client?.handleNotification(userInfo: userInfo)
+            } else if let raw = object["pushPermission"]?.stringValue {
+                let status = try XCTUnwrap(WhisperrPushPermissionStatus(rawValue: raw), testCase.name)
+                await client?.pushPermissionChanged(status)
+            } else if object["reset"] == true {
+                await client?.reset()
+            } else if object["optOut"] == true {
+                await client?.optOut()
+            } else if object["optIn"] == true {
+                await client?.optIn()
             } else {
                 XCTFail("\(testCase.name): unknown step \(step)")
             }

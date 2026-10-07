@@ -30,14 +30,16 @@ struct PushCase: Decodable {
 }
 
 /// One step of a push case: exactly one of `identify` / `setPushToken` /
-/// `restart` / `reset` is set. `restart` tears the client down and builds a
-/// fresh one sharing the same persistence, simulating an app relaunch; `reset`
-/// maps to reset()/logout.
+/// `restart` / `reset` / `optOut` / `optIn` is set. `restart` tears the client
+/// down and builds a fresh one sharing the same persistence, simulating an app
+/// relaunch; `reset` maps to reset()/logout.
 struct PushStep: Decodable {
     let identify: [String: JSONValue]?
     let setPushToken: PushTokenStep?
     let restart: Bool?
     let reset: Bool?
+    let optOut: Bool?
+    let optIn: Bool?
 }
 
 /// `setPushToken` is a bare token string, or (in `kindCases`) an object with

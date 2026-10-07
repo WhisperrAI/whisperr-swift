@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Opt-out reaches the server.** `optOut()` sends one identify that opts this
+  device's push token out (`opted_in: false`) when a user is known and the
+  token was registered. The SDK delivers and retries it like any queued request,
+  also after a restart. Then it sends nothing until `optIn()`. Opt-out forgets
+  the last-sent token, so after `optIn()` the next `setPushToken` registers it
+  again. A second `optOut()` is a no-op.
+- **Conformance.** The spec runners execute the new `push_permission_changed`
+  cases in `automatic.json` and the opt-out cases in `push.json`.
+
 ## 0.4.0
 
 This is a minor release (0.4.0). It makes push work end to end on iOS.

@@ -208,16 +208,40 @@ public actor WhisperrClient {
     }
 
     /// Stops all collection: nothing is queued or sent until `optIn()`. Work
-    /// already queued is discarded. The choice is persisted. This is local to
-    /// the device; it does not delete data already sent.
+    /// already queued is discarded. The choice is persisted.
+    ///
+    /// When a user is known and this device registered a push token for
+    /// them, the SDK first sends one identify that opts that token out, so
+    /// the server stops sending push to this device. Other channels and the
+    /// user's other devices are not changed, and data already sent is not
+    /// deleted. After `optIn()`, the next `setPushToken` registers the token
+    /// again.
     public func optOut() async {
         await start()
+        guard !optedOut else {
+            return
+        }
+        var pushOptOut: QueuedOperation?
+        if let userID = currentUserID, lastPushUserID == userID, let token = lastPushToken {
+            pushOptOut = QueuedOperation(
+                id: idGenerator(),
+                kind: .identify,
+                body: [
+                    "external_user_id": .string(userID),
+                    "channels": .array([.object(WhisperrChannel.push(token, optedIn: false).body)])
+                ]
+            )
+        }
         optedOut = true
-        let discarded = queue
-        queue.removeAll()
+        queue = pushOptOut.map { [$0] } ?? []
         pendingPush = nil
-        await forgetPushMark(discarded)
+        lastPushToken = nil
+        lastPushUserID = nil
+        lastPushMetadata = PushMetadata()
         await persist()
+        if pushOptOut != nil {
+            await flush()
+        }
     }
 
     /// Resumes collection after `optOut()`.
