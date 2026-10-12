@@ -21,9 +21,9 @@ final class PushTokenTests: XCTestCase {
         await transport.requests.filter { $0.path == "/v1/identify" }.map(\.body)
     }
 
-    func testDeviceTokenSendsLowercaseHexWithAPNsKindPlatformAndEnvironment() async throws {
+    func testDeviceTokenSendsLowercaseHexWithAPNsKindPlatformEnvironmentAndBundleID() async throws {
         let transport = MockTransport()
-        let client = makeClient(transport: transport)
+        let client = makeClient(transport: transport, environment: .device)
         try await client.identify("user_1")
 
         try await client.setPushToken(apnsBytes, environment: .production)
@@ -31,31 +31,36 @@ final class PushTokenTests: XCTestCase {
 
         let entries = await pushEntries(transport)
         XCTAssertEqual(entries.count, 1)
-        var expected: [String: JSONValue] = [
+        XCTAssertEqual(entries[0], [
             "channel": "push",
             "address": .string(apnsHex),
             "opted_in": true,
             "kind": "apns",
-            "push_env": "production"
-        ]
-        if let platform = WhisperrPushPlatform.current {
-            expected["platform"] = .string(platform.rawValue)
-        }
-        XCTAssertEqual(entries[0], expected)
+            "platform": "ios",
+            "push_env": "production",
+            "client_app_id": "com.example.app"
+        ])
         XCTAssertEqual(apnsHex.count, 64)
     }
 
     func testDeviceTokenWithoutOverrideUsesTheDetectedEnvironment() async throws {
         let transport = MockTransport()
-        let client = makeClient(transport: transport)
+        let client = makeClient(transport: transport, environment: .device)
         try await client.identify("user_1")
 
         try await client.setPushToken(deviceToken: apnsBytes) // 0.3.x label
         await client.flush()
 
         let entries = await pushEntries(transport)
-        XCTAssertEqual(entries.first?["push_env"], .string(WhisperrPushEnvironment.current.rawValue))
+        XCTAssertEqual(entries.first?["push_env"], "sandbox")
         XCTAssertEqual(entries.first?["kind"], "apns")
+    }
+
+    func testRealEnvironmentReadsTheDetectedPushFields() {
+        let environment = AppEnvironment.current()
+        XCTAssertEqual(environment.apnsEnvironment, WhisperrPushEnvironment.current)
+        XCTAssertEqual(environment.pushPlatform, WhisperrPushPlatform.current)
+        XCTAssertEqual(environment.clientAppID, Bundle.main.bundleIdentifier)
     }
 
     func testFCMTokenSendsFCMKind() async throws {
@@ -132,8 +137,11 @@ final class PushTokenTests: XCTestCase {
         try await client.setPushToken(apnsBytes, environment: .production)
         await client.flush()
 
+        // One registration, then the restore identify for the stored user
+        // (queued at the flush).
         let bodies = await identifyBodies(transport)
-        XCTAssertEqual(bodies.count, 1)
+        XCTAssertEqual(bodies.count, 2)
+        XCTAssertNil(bodies[1].objectValue?["channels"])
         let entries = await pushEntries(transport)
         XCTAssertEqual(entries.count, 1)
         XCTAssertEqual(entries[0]["address"], .string(apnsHex))
@@ -141,23 +149,29 @@ final class PushTokenTests: XCTestCase {
         XCTAssertEqual(entries[0]["push_env"], "production")
     }
 
-    func testTokenBufferedBeforeIdentifyKeepsItsFields() async throws {
+    func testTokenSetBeforeIdentifyKeepsItsFieldsWhenAttachedToTheUser() async throws {
         let transport = MockTransport()
         let client = makeClient(transport: transport)
         try await client.setPushToken(apnsBytes, environment: .sandbox)
         try await client.identify("user_1")
         await client.flush()
 
+        // Sent anonymously at once, then attached to the user's identify.
+        let bodies = await identifyBodies(transport)
+        XCTAssertEqual(bodies.count, 2)
+        XCTAssertNotNil(bodies[0].objectValue?["anonymous_id"])
+        XCTAssertNil(bodies[0].objectValue?["external_user_id"])
+        XCTAssertEqual(bodies[1].objectValue?["external_user_id"], "user_1")
         let entries = await pushEntries(transport)
-        XCTAssertEqual(entries.count, 1)
-        XCTAssertEqual(entries[0]["kind"], "apns")
-        XCTAssertEqual(entries[0]["push_env"], "sandbox")
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.map { $0["kind"] }, ["apns", "apns"])
+        XCTAssertEqual(entries.map { $0["push_env"] }, ["sandbox", "sandbox"])
 
         // The identify recorded the fields: the same capture is a no-op.
         try await client.setPushToken(apnsBytes, environment: .sandbox)
         await client.flush()
         let after = await pushEntries(transport)
-        XCTAssertEqual(after.count, 1)
+        XCTAssertEqual(after.count, 2)
     }
 
     func testRotationOptOutCarriesNoTokenFields() async throws {
@@ -176,7 +190,7 @@ final class PushTokenTests: XCTestCase {
         XCTAssertEqual(entries[2]["kind"], "apns")
     }
 
-    func testResetForgetsTokenFields() async throws {
+    func testResetMovesTheTokenWithItsFields() async throws {
         let transport = MockTransport()
         let client = makeClient(transport: transport)
         try await client.identify("user_1")
@@ -186,9 +200,13 @@ final class PushTokenTests: XCTestCase {
         try await client.setPushToken(apnsBytes, environment: .sandbox)
         await client.flush()
 
+        // Registration, opt-out under the old user (no fields), anonymous
+        // opt-in with the fields, attached to the next identify; the last
+        // capture is a no-op.
         let entries = await pushEntries(transport)
-        XCTAssertEqual(entries.count, 2)
-        XCTAssertEqual(entries.map { $0["push_env"] }, ["sandbox", "sandbox"])
+        XCTAssertEqual(entries.count, 4)
+        XCTAssertEqual(entries.map { $0["opted_in"] }, [true, false, true, true])
+        XCTAssertEqual(entries.map { $0["push_env"] }, ["sandbox", nil, "sandbox", "sandbox"])
     }
 
     func testChannelBodyDropsTokenFieldsOnNonPushChannels() {

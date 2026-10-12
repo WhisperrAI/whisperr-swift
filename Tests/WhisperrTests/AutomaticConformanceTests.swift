@@ -4,6 +4,14 @@ import XCTest
 struct AutomaticSpec: Decodable {
     let reserved: [ReservedEvent]
     let cases: [AutomaticCase]
+    /// Contract v2 push events: push_received, push_opened action_id and
+    /// cold_start.
+    let pushEventsV2: AutomaticV2Section?
+}
+
+struct AutomaticV2Section: Decodable {
+    let supersedes: [String]
+    let cases: [AutomaticCase]
 }
 
 struct ReservedEvent: Decodable {
@@ -33,6 +41,8 @@ struct AutomaticDevice: Decodable {
 struct AutomaticExpectedEvent: Decodable {
     let event_type: String
     let properties: [String: JSONValue]
+    /// Contract v2: the governed context keys this event must carry.
+    let context: [String: JSONValue]?
 }
 
 /// Executes whisperr-spec conformance/automatic.json: the reserved automatic
@@ -41,7 +51,22 @@ final class AutomaticConformanceTests: XCTestCase {
     func testAutomaticFlowsMatchSpec() async throws {
         let spec: AutomaticSpec = try loadSpec(fileName: "automatic.json", envKey: "WHISPERR_AUTOMATIC_SPEC_PATH")
         XCTAssertFalse(spec.cases.isEmpty)
-        for testCase in spec.cases {
+        let superseded = supersededCases(in: "automatic.json")
+        for testCase in spec.cases where !superseded.contains(testCase.name) {
+            try await run(testCase)
+        }
+    }
+
+    func testPushEventsV2MatchSpec() async throws {
+        let spec: AutomaticSpec = try loadSpec(fileName: "automatic.json", envKey: "WHISPERR_AUTOMATIC_SPEC_PATH")
+        let section = try XCTUnwrap(spec.pushEventsV2, "automatic.json has no pushEventsV2")
+        XCTAssertFalse(section.cases.isEmpty)
+        for testCase in section.cases {
+            // Swift has no Notification Service Extension receipt path.
+            let receiptSources = testCase.steps.compactMap { $0.objectValue?["receivePush"]?.objectValue?["source"]?.stringValue }
+            guard receiptSources.allSatisfy({ $0 == "foreground" }) else {
+                continue
+            }
             try await run(testCase)
         }
     }
@@ -52,7 +77,7 @@ final class AutomaticConformanceTests: XCTestCase {
         let reserved = Set(spec.reserved.map(\.name))
         let sent = [
             "app_installed", "app_updated", "app_opened", "app_backgrounded",
-            "screen_viewed", "push_opened", "push_permission_changed"
+            "screen_viewed", "push_opened", "push_received", "push_permission_changed"
         ]
         for name in sent {
             XCTAssertTrue(reserved.contains(name), name)
@@ -121,6 +146,15 @@ final class AutomaticConformanceTests: XCTestCase {
                     out[pair.key] = pair.value.stringValue ?? ""
                 }
                 _ = await client?.handleNotification(userInfo: userInfo)
+            } else if let receive = object["receivePush"]?.objectValue {
+                _ = try await client?.trackPushReceived(userInfo: Self.userInfo(receive["data"]))
+            } else if let open = object["openPush"]?.objectValue {
+                let payload = try XCTUnwrap(WhisperrPushPayload(
+                    userInfo: Self.userInfo(open["data"]),
+                    actionID: open["actionId"]?.stringValue,
+                    coldStart: open["launchedApp"]?.boolValue
+                ), testCase.name)
+                _ = await client?.handleNotification(payload)
             } else if let raw = object["pushPermission"]?.stringValue {
                 let status = try XCTUnwrap(WhisperrPushPermissionStatus(rawValue: raw), testCase.name)
                 await client?.pushPermissionChanged(status)
@@ -148,13 +182,24 @@ final class AutomaticConformanceTests: XCTestCase {
         for event in sent {
             XCTAssertNotNil(event["context"]?.objectValue?["$message_id"], "\(testCase.name): context.$message_id")
         }
+        for (event, expectedEvent) in zip(sent, testCase.expectedEvents) {
+            if let expectedContext = expectedEvent.context {
+                assertGovernedContext(event["context"]?.objectValue ?? [:], expectedContext, testCase.name)
+            }
+        }
+    }
+
+    private static func userInfo(_ data: JSONValue?) -> [AnyHashable: Any] {
+        (data?.objectValue ?? [:]).reduce(into: [AnyHashable: Any]()) { out, pair in
+            out[pair.key] = pair.value.stringValue ?? ""
+        }
     }
 
     private func substitute(_ properties: [String: JSONValue]) -> [String: JSONValue] {
         properties.mapValues { value in
             switch value {
             case "$platform":
-                return "ios"
+                return "ios" // os_name too: the fixture names both $platform
             case "$sdk_name":
                 return "whisperr-swift"
             case "$sdk_version":

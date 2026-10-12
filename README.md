@@ -9,7 +9,7 @@ stable event idempotency.
 Add the package in Xcode or Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.4.0")
+.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.5.0")
 ```
 
 ## Quick Start
@@ -31,6 +31,11 @@ try await whisperr.track(
 
 await whisperr.flush()
 ```
+
+Call `identify()` after login or sign-up, **and on session restore at app
+start** (when your app finds a signed-in user). The SDK cannot know a user who
+signed in before you installed the SDK: only your `identify()` call can tell
+it.
 
 `track()` uses the user from the most recent `identify()` call. You can also
 pass `userID:` explicitly for events emitted outside a signed-in session.
@@ -59,10 +64,14 @@ with no extra code:
 | `app_backgrounded` | `foreground_ms` | the app goes to the background |
 | `push_permission_changed` | `status`, `previous_status` | the app comes to the foreground and the notification permission changed (see [Permission](#2-permission)) |
 
-Each one, and also `screen_viewed` and `push_opened`, carries `app_version`,
-`app_build`, `os_name` (lowercase, `"ios"` on iPhone and iPad), `os_version`,
-`platform` (the OS family, `"ios"`), `sdk_name` (`"whisperr-swift"`),
-`sdk_version`, `locale` and `timezone` (IANA name).
+Each one, and also `screen_viewed`, `push_opened` and `push_received`,
+carries `app_version`, `app_build`, `os_name` (lowercase, `"ios"` on iPhone
+and iPad), `os_version`, `platform` (the OS family, `"ios"`), `sdk_name`
+(`"whisperr-swift"`), `sdk_version`, `locale` and `timezone` (IANA name).
+
+Every event, also your own `track()` events, carries `app_version`,
+`app_build`, `platform`, `sdk_name` and `sdk_version` in `context`. A value
+the platform cannot provide is left out. A `context` key you pass wins.
 
 Install and update detection compare the app version with the one stored at
 the last launch, so they need persistence (on by default). After an upgrade
@@ -102,6 +111,31 @@ try await whisperr.identify(
 
 `identify()` also sends `traits.timezone` (`TimeZone.current.identifier`, an IANA name) and `traits.locale` (`Locale.current`, normalized to BCP 47) by default so quiet hours and message language match the user; values you pass in `traits` always win, and nothing is sent for a value the platform can't provide.
 
+**Session restore.** Call `identify()` again when the app starts with a
+signed-in user. The SDK also helps: at start, when it has a stored user, it
+queues one restore identify (`external_user_id`, `anonymous_id`, the
+`timezone`, `locale` and `app_language` traits, no channels). It waits a few
+seconds first; when your app identifies the same user in that time, the SDK
+sends nothing extra. It also sends nothing when the server got the same values
+for this user in the last 24 hours. The restore identify goes through the
+same persisted queue, so it waits there while the device is offline.
+
+### App language
+
+When your app has its own language setting, tell the SDK. Whisperr writes
+messages in this language. Use a BCP 47 tag (`de`, `pt-BR`; `pt_BR` also
+works). This is the language the user picked in your app, not the device
+locale.
+
+```swift
+Whisperr.setAppLanguage("pt-BR")          // or: await client.setAppLanguage("pt-BR")
+```
+
+The SDK stores the value and sends it at once (for the current user, or
+anonymously before login). Every later `identify()` carries it as
+`traits.app_language`; a `traits["app_language"]` you pass wins. The same
+value again sends nothing. `setAppLanguage(nil)` clears the stored value.
+
 Shortcut `email`, `phone`, and `pushToken` values expand to opted-in channels.
 Use explicit `WhisperrChannel` values when you need consent or verification
 control.
@@ -129,8 +163,9 @@ func application(
 ```
 
 The SDK sends the token as lowercase hex with `kind: "apns"`,
-`platform: "ios"` and `push_env`. APNs has two environments, and a token
-works in one only. The SDK finds the environment by itself:
+`platform: "ios"`, `push_env` and your bundle id as `client_app_id`. APNs has
+two environments, and a token works in one only. The SDK finds the environment
+by itself:
 
 - It reads `aps-environment` from the app's embedded provisioning profile.
   `development` gives `sandbox`. `production` gives `production`.
@@ -142,32 +177,37 @@ works in one only. The SDK finds the environment by itself:
 To set the environment yourself, pass it:
 `Whisperr.setPushToken(deviceToken, environment: .production)`.
 
-Firebase Cloud Messaging: pass the FCM registration token. The SDK sends
-`kind: "fcm"`.
+Firebase Cloud Messaging: pass the FCM registration token and your Firebase
+project id. The SDK sends `kind: "fcm"` and the project as
+`provider_project`, so the server can catch a token from another Firebase
+project. The SDK does not depend on Firebase.
 
 ```swift
 func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
     if let fcmToken {
-        Whisperr.setPushToken(fcmToken: fcmToken)
+        Whisperr.setPushToken(fcmToken: fcmToken, firebaseProjectID: FirebaseApp.app()?.options.projectID)
     }
 }
 ```
 
-Other tokens (Expo, OneSignal): use
-`client.setPushToken(token, kind: .expo)` or `kind: .oneSignalSubscription`.
-Without `kind`, the server finds the type from the token.
+OneSignal: `Whisperr.setPushToken(oneSignalSubscriptionID: id, oneSignalAppID: "your-app-id")`.
+Other tokens (Expo): `client.setPushToken(token, kind: .expo, providerProject: easProjectID)`.
+Without `kind`, the server finds the type from the token. Every token also
+carries the device `platform` and `client_app_id`.
 
 Token rules:
 
 - Call it on every launch. The SDK sends the token only when the token, or
-  one of its fields, changed. This also holds after an app restart.
+  one of its fields, changed, or when it last sent it 7 days ago or more.
+  This also holds after an app restart.
 - **After login**, the SDK sends the token at once.
-- **Before login**, the SDK keeps the token and sends it with the next
-  `identify()`.
+- **Before login**, the SDK also sends the token at once, under the device's
+  `anonymous_id`. The next `identify()` moves it to the user.
 - **Token rotation**: the SDK opts out the token it sent before and opts in
   the new one. Tokens from the user's other devices stay as they are.
-- After `reset()` (logout), the SDK forgets the token. Call `setPushToken`
-  again when the next user logs in.
+- **After `reset()` (logout)**, the SDK opts the token out for the old user
+  and registers it under the new `anonymous_id`. The device stays reachable,
+  but not as the old user.
 
 ### 2. Permission
 
@@ -184,7 +224,16 @@ the token back in. If the token was the user's only opted-in channel, the
 server suppresses the user (`all_channels_opted_out`) until a channel is opted
 in again.
 
-By default the SDK reads the status each time the app comes to the
+To ask the user, let the SDK show the prompt. It reports the answer at once:
+
+```swift
+let status = await Whisperr.requestPushAuthorization()                 // alert, badge, sound
+let quiet = await Whisperr.requestPushAuthorization(provisional: true) // no prompt, quiet delivery
+```
+
+Then call `registerForRemoteNotifications()` to get the token.
+
+By default the SDK also reads the status each time the app comes to the
 foreground. It uses `getNotificationSettings`, which never shows a prompt.
 After your own prompt, report the answer at once:
 
@@ -202,8 +251,9 @@ turns it off too.
 ### 3. Opens and deep links
 
 Call `handleNotificationResponse` when the user taps a notification. For a
-Whisperr notification it sends `push_opened` with `whisperr_message_id`. It
-returns the deep link from `whisperr_deep_link` (the older `deep_link` key
+Whisperr notification it sends `push_opened` with `whisperr_message_id`,
+`action_id` (`default` for a tap, or the id of the action button) and
+`cold_start` (`true` when the tap started the app). It returns the deep link from `whisperr_deep_link` (the older `deep_link` key
 works too). It sends one event for each message, also when the same tap
 arrives twice. It returns `nil`, and sends nothing, for notifications from
 other senders and for a dismissal.
@@ -219,6 +269,12 @@ ways, not both: route the return value, or take the pending link.
 Set the `UNUserNotificationCenter` delegate before
 `application(_:didFinishLaunchingWithOptions:)` returns. If you do not, pass
 the launch options to `Whisperr.handleLaunchOptions(launchOptions)`.
+
+**Received in the foreground.** Call `Whisperr.handleWillPresent(notification)`
+in `userNotificationCenter(_:willPresent:withCompletionHandler:)`. For a
+Whisperr notification it sends `push_received` (`whisperr_message_id`,
+`foreground: true`, `source: "foreground"`) once per message. Receipt in the
+background (from a Notification Service Extension) is not sent in this version.
 
 #### SwiftUI app
 
@@ -258,6 +314,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        Whisperr.handleWillPresent(notification) // sends push_received
         completionHandler([.banner, .list, .sound]) // show pushes while the app is open, too
     }
 }
@@ -467,5 +524,11 @@ The test suite consumes the shared `whisperr-spec` fixtures:
 ```bash
 WHISPERR_SPEC_PATH=../whisperr-spec/conformance/wire.json swift test
 ```
+
+The other fixtures (`push.json`, `anonymous.json`, `behavior.json`,
+`automatic.json`, and the contract v2 `v2.json`) load from the same
+directory. The SDK runs the v2 sections `restoreIdentify`, `appLanguage`,
+`anonymousPush`, `pushRegistration`, `versionContext` and `automatic.json`
+`pushEventsV2`, and skips the legacy cases they supersede.
 
 Whisperr - predict churn, automate interventions, recover revenue.

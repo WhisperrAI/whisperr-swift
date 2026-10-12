@@ -9,9 +9,10 @@ public enum WhisperrChannelType: String, Codable, Sendable {
 
 /// A reachable address or token for a user.
 ///
-/// `kind`, `platform` and `pushEnvironment` describe a push token (whisperr-spec
-/// SPEC.md → Token kind). They are sent only on `push` channels and only when
-/// set: the server infers a missing kind from the token.
+/// `kind`, `platform`, `pushEnvironment`, `clientAppID` and `providerProject`
+/// describe a push token (whisperr-spec SPEC.md → Token kind). They are sent
+/// only on `push` channels and only when set: the server infers a missing kind
+/// from the token.
 public struct WhisperrChannel: Equatable, Sendable {
     public let type: WhisperrChannelType
     public let address: String
@@ -20,6 +21,12 @@ public struct WhisperrChannel: Equatable, Sendable {
     public let kind: WhisperrPushKind?
     public let platform: WhisperrPushPlatform?
     public let pushEnvironment: WhisperrPushEnvironment?
+    /// The app that made the token: the iOS bundle id. The server uses it to
+    /// pick the APNs topic and to catch a token from another app.
+    public let clientAppID: String?
+    /// The provider project of the token: the Firebase project id (FCM), the
+    /// EAS project id (Expo) or the OneSignal app id.
+    public let providerProject: String?
 
     public init(
         type: WhisperrChannelType,
@@ -28,7 +35,9 @@ public struct WhisperrChannel: Equatable, Sendable {
         verified: Bool? = nil,
         kind: WhisperrPushKind? = nil,
         platform: WhisperrPushPlatform? = nil,
-        pushEnvironment: WhisperrPushEnvironment? = nil
+        pushEnvironment: WhisperrPushEnvironment? = nil,
+        clientAppID: String? = nil,
+        providerProject: String? = nil
     ) {
         self.type = type
         self.address = address
@@ -37,6 +46,8 @@ public struct WhisperrChannel: Equatable, Sendable {
         self.kind = kind
         self.platform = platform
         self.pushEnvironment = pushEnvironment
+        self.clientAppID = clientAppID
+        self.providerProject = providerProject
     }
 
     public static func email(
@@ -61,7 +72,9 @@ public struct WhisperrChannel: Equatable, Sendable {
         verified: Bool? = nil,
         kind: WhisperrPushKind? = nil,
         platform: WhisperrPushPlatform? = nil,
-        pushEnvironment: WhisperrPushEnvironment? = nil
+        pushEnvironment: WhisperrPushEnvironment? = nil,
+        clientAppID: String? = nil,
+        providerProject: String? = nil
     ) -> WhisperrChannel {
         WhisperrChannel(
             type: .push,
@@ -70,17 +83,22 @@ public struct WhisperrChannel: Equatable, Sendable {
             verified: verified,
             kind: kind,
             platform: platform,
-            pushEnvironment: pushEnvironment
+            pushEnvironment: pushEnvironment,
+            clientAppID: clientAppID,
+            providerProject: providerProject
         )
     }
 
-    /// True when this push entry sets a token field (kind, platform or
-    /// environment) to a value other than `known`. The server keeps a stored
-    /// value when a field is not sent, so a missing field is not a change.
+    /// True when this push entry sets a token field (kind, platform,
+    /// environment, client app id or provider project) to a value other than
+    /// `known`. The server keeps a stored value when a field is not sent, so a
+    /// missing field is not a change.
     func addsPushMetadata(to known: PushMetadata) -> Bool {
         (kind != nil && kind?.rawValue != known.kind)
             || (platform != nil && platform?.rawValue != known.platform)
             || (pushEnvironment != nil && pushEnvironment?.rawValue != known.pushEnvironment)
+            || (clientAppID != nil && clientAppID != known.clientAppID)
+            || (providerProject != nil && providerProject != known.providerProject)
     }
 
     var body: [String: JSONValue] {
@@ -104,17 +122,25 @@ public struct WhisperrChannel: Equatable, Sendable {
             if let pushEnvironment {
                 out["push_env"] = .string(pushEnvironment.rawValue)
             }
+            if let clientAppID {
+                out["client_app_id"] = .string(clientAppID)
+            }
+            if let providerProject {
+                out["provider_project"] = .string(providerProject)
+            }
         }
         return out
     }
 }
 
 /// The token fields last delivered for the remembered push token, as wire
-/// strings. Persisted with the (user, token) pair.
+/// strings. Persisted with the (subject, token) pair.
 struct PushMetadata: Equatable, Sendable {
     var kind: String?
     var platform: String?
     var pushEnvironment: String?
+    var clientAppID: String?
+    var providerProject: String?
 
     /// Applies the fields a delivered entry sent. A field it did not send
     /// keeps its value, as on the server.
@@ -128,6 +154,68 @@ struct PushMetadata: Equatable, Sendable {
         if let environment = channel.pushEnvironment {
             self.pushEnvironment = environment.rawValue
         }
+        if let clientAppID = channel.clientAppID {
+            self.clientAppID = clientAppID
+        }
+        if let providerProject = channel.providerProject {
+            self.providerProject = providerProject
+        }
+    }
+
+    /// An opted-in push entry for `token` with these fields.
+    func entry(for token: String) -> WhisperrChannel {
+        .push(
+            token,
+            optedIn: true,
+            kind: kind.flatMap(WhisperrPushKind.init(rawValue:)),
+            platform: platform.flatMap(WhisperrPushPlatform.init(rawValue:)),
+            pushEnvironment: pushEnvironment.flatMap(WhisperrPushEnvironment.init(rawValue:)),
+            clientAppID: clientAppID,
+            providerProject: providerProject
+        )
+    }
+}
+
+/// Who a push token is registered for: the identified user, or the device's
+/// anonymous handle (whisperr-spec SPEC.md → Anonymous push tokens).
+enum PushSubject: Equatable, Sendable {
+    case user(String)
+    case anonymous(String)
+
+    /// The identify body field that names this subject.
+    var bodyField: (key: String, value: JSONValue) {
+        switch self {
+        case .user(let id):
+            return ("external_user_id", .string(id))
+        case .anonymous(let id):
+            return ("anonymous_id", .string(id))
+        }
+    }
+
+    /// An identify body for this subject with `channels`.
+    func identifyBody(channels: [WhisperrChannel]) -> [String: JSONValue] {
+        let field = bodyField
+        return [
+            field.key: field.value,
+            "channels": .array(channels.map { .object($0.body) })
+        ]
+    }
+}
+
+/// The restore record (whisperr-spec SPEC.md → Restore identify at start):
+/// the user, the restore traits of the last delivered `identify()` or restore
+/// identify (a delivered `setAppLanguage` partial updates `app_language`), and
+/// when that identify was delivered. A restore identify is skipped while it
+/// would send the same restore traits within 24 hours.
+struct IdentityRecord: Codable, Equatable, Sendable {
+    var user: String
+    var traits: [String: JSONValue] = [:]
+    var deliveredAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case user
+        case traits
+        case deliveredAt = "delivered_at"
     }
 }
 
@@ -224,6 +312,10 @@ struct QueuedOperation: Codable, Equatable, Sendable {
     let id: String
     let kind: QueuedOperationKind
     var body: [String: JSONValue]
+    /// Set on an identify from `identify()` or a restore identify: the
+    /// restore traits (device defaults + `app_language`) computed when the op
+    /// was built. Its delivery starts a new 24-hour restore window.
+    var restoreTraits: [String: JSONValue]?
 }
 
 /// Everything the client persists between launches: the pending queue, the
@@ -233,8 +325,11 @@ struct QueuedOperation: Codable, Equatable, Sendable {
 /// version seen (for `app_installed` / `app_updated`) and the push message ids
 /// already reported as opened, the token fields (kind, platform, environment)
 /// last delivered with the push token, the last notification permission
-/// sent, and the last one reported. Fields added after 0.2.2 are optional so
-/// older state still decodes.
+/// sent, and the last one reported. 0.5.0 adds the anonymous subject of the
+/// push pair, when the pair was last sent, the app language, the last
+/// delivered identify, and the push message ids already reported as
+/// received. Fields added after 0.2.2 are optional so older state still
+/// decodes.
 struct PersistedState: Codable, Equatable, Sendable {
     var queue: [QueuedOperation] = []
     var userID: String?
@@ -251,6 +346,16 @@ struct PersistedState: Codable, Equatable, Sendable {
     var pushPermission: String?
     /// The last permission reported, sent or not; `denied` holds push tokens.
     var pushPermissionStatus: String?
+    /// Set instead of `lastPushUserID` when the pair was sent anonymously.
+    var lastPushAnonymousID: String?
+    var lastPushClientAppID: String?
+    var lastPushProviderProject: String?
+    /// When the pair was last sent, in seconds since 1970. Nil (state from
+    /// 0.4.x) means the next `setPushToken` sends again.
+    var lastPushSentAt: Double?
+    var appLanguage: String?
+    var lastIdentify: IdentityRecord?
+    var receivedPushMessageIDs: [String]?
 
     var isEmpty: Bool {
         queue.isEmpty && userID == nil && lastPushUserID == nil && lastPushToken == nil
@@ -258,6 +363,9 @@ struct PersistedState: Codable, Equatable, Sendable {
             && (openedPushMessageIDs ?? []).isEmpty
             && lastPushKind == nil && lastPushPlatform == nil && lastPushEnvironment == nil
             && pushPermission == nil && pushPermissionStatus == nil
+            && lastPushAnonymousID == nil && lastPushClientAppID == nil && lastPushProviderProject == nil
+            && lastPushSentAt == nil && appLanguage == nil && lastIdentify == nil
+            && (receivedPushMessageIDs ?? []).isEmpty
     }
 
     enum CodingKeys: String, CodingKey {
@@ -275,6 +383,13 @@ struct PersistedState: Codable, Equatable, Sendable {
         case lastPushEnvironment = "last_push_env"
         case pushPermission = "push_permission"
         case pushPermissionStatus = "push_permission_status"
+        case lastPushAnonymousID = "last_push_anonymous_id"
+        case lastPushClientAppID = "last_push_client_app_id"
+        case lastPushProviderProject = "last_push_provider_project"
+        case lastPushSentAt = "last_push_sent_at"
+        case appLanguage = "app_language"
+        case lastIdentify = "last_identify"
+        case receivedPushMessageIDs = "received_push_message_ids"
     }
 }
 

@@ -174,6 +174,8 @@ final class WhisperrClientTests: XCTestCase {
         let identifies = await transport.requests
             .filter { $0.path == "/v1/identify" }
             .map(\.body)
+        // The rotation, then the restore identify for the stored user (queued
+        // at the first flush).
         XCTAssertEqual(identifies, [
             .object([
                 "external_user_id": .string("user_1"),
@@ -189,7 +191,8 @@ final class WhisperrClientTests: XCTestCase {
                         "opted_in": .bool(true)
                     ])
                 ])
-            ])
+            ]),
+            .object(["external_user_id": .string("user_1")])
         ])
     }
 }
