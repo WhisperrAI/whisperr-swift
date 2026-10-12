@@ -93,7 +93,7 @@ final class V2Device: @unchecked Sendable {
             appVersion: values["appVersion"]?.stringValue,
             appBuild: values["appBuild"]?.stringValue,
             osName: "ios",
-            osVersion: nil,
+            osVersion: values["osVersion"]?.stringValue,
             platform: "ios",
             clientAppID: values["clientAppId"]?.stringValue,
             pushPlatform: .ios,
@@ -245,54 +245,55 @@ final class V2ConformanceTests: XCTestCase {
         }
         await client.close()
 
-        // SPEC.md: an explicit permission report always sends
-        // push_permission_changed, also with automatic events off. v2.json
-        // lists no such events (its pushPermission steps follow push.json,
-        // which compares identify bodies only), so they are left out here.
-        let requests = await transport.requests.compactMap { request -> MockTransport.Request? in
-            guard request.path == "/v1/events/batch", var body = request.body.objectValue else {
-                return request
-            }
-            let events = (body["events"]?.arrayValue ?? []).filter {
-                $0.objectValue?["event_type"] != "push_permission_changed"
-            }
-            guard !events.isEmpty else {
-                return nil
-            }
-            body["events"] = .array(events)
-            return MockTransport.Request(path: request.path, body: .object(body))
-        }
-        XCTAssertEqual(requests.count, testCase.expectedRequests.count, "\(label): request count")
+        // Comparison is per endpoint: the identify bodies in order, and the
+        // events in order. The order between an identify and an event is
+        // open (a permission report queues both in one step).
+        let requests = await transport.requests
+        let identifyBodies = requests.filter { $0.path == "/v1/identify" }.map(\.body)
+        let events = requests.filter { $0.path == "/v1/events/batch" }
+            .flatMap { $0.body.objectValue?["events"]?.arrayValue ?? [] }
+        let expectedBodies = testCase.expectedRequests.filter { $0.endpoint == "/v1/identify" }.compactMap(\.body)
+        let expectedEvents = testCase.expectedRequests.filter { $0.endpoint == "/v1/events/batch" }
+            .flatMap { $0.events ?? [] }
+        XCTAssertEqual(
+            requests.filter { $0.path != "/v1/identify" && $0.path != "/v1/events/batch" }.count, 0,
+            "\(label): unexpected endpoint"
+        )
+
         var bindings = PlaceholderBindings()
-        for (index, (actual, expected)) in zip(requests, testCase.expectedRequests).enumerated() {
-            let at = "\(label)[\(index)]"
-            XCTAssertEqual(actual.path, expected.endpoint, at)
-            if let expectedBody = expected.body.map(substituteSDKPlaceholders) {
-                var body = actual.body.objectValue ?? [:]
-                // An SDK may keep a handle for its anonymous lane: ignore it on
-                // an identified body unless the fixture names it.
-                if body["external_user_id"] != nil, expectedBody.objectValue?["anonymous_id"] == nil {
-                    body.removeValue(forKey: "anonymous_id")
-                }
-                bindings.assertMatches(.object(body), expectedBody, at)
+        XCTAssertEqual(identifyBodies.count, expectedBodies.count, "\(label): identify count")
+        for (index, (actual, expected)) in zip(identifyBodies, expectedBodies).enumerated() {
+            let expectedBody = substituteSDKPlaceholders(expected)
+            var body = actual.objectValue ?? [:]
+            // An SDK may keep a handle for its anonymous lane: ignore it on an
+            // identified body unless the fixture names it.
+            if body["external_user_id"] != nil, expectedBody.objectValue?["anonymous_id"] == nil {
+                body.removeValue(forKey: "anonymous_id")
             }
-            if let expectedEvents = expected.events {
-                let events = actual.body.objectValue?["events"]?.arrayValue ?? []
-                XCTAssertEqual(events.count, expectedEvents.count, "\(at): event count")
-                for (event, expectedEvent) in zip(events, expectedEvents) {
-                    var actualEvent = event.objectValue ?? [:]
-                    var wanted = substituteSDKPlaceholders(expectedEvent).objectValue ?? [:]
-                    let context = actualEvent["context"]?.objectValue ?? [:]
-                    XCTAssertNotNil(context["$message_id"], "\(at): context.$message_id")
-                    if let expectedContext = wanted["context"]?.objectValue {
-                        assertGovernedContext(context, expectedContext, at)
-                    }
-                    actualEvent.removeValue(forKey: "context")
-                    actualEvent.removeValue(forKey: "occurred_at")
-                    wanted.removeValue(forKey: "context")
-                    bindings.assertMatches(.object(actualEvent), .object(wanted), at)
-                }
+            bindings.assertMatches(.object(body), expectedBody, "\(label) identify[\(index)]")
+        }
+
+        XCTAssertEqual(events.count, expectedEvents.count, "\(label): event count")
+        for (index, (event, expectedEvent)) in zip(events, expectedEvents).enumerated() {
+            let at = "\(label) event[\(index)]"
+            var actualEvent = event.objectValue ?? [:]
+            var wanted = substituteSDKPlaceholders(expectedEvent).objectValue ?? [:]
+            let context = actualEvent["context"]?.objectValue ?? [:]
+            XCTAssertNotNil(context["$message_id"], "\(at): context.$message_id")
+            if wanted["event_type"] == "push_permission_changed" {
+                // The automatic event: compared as automatic.json does, without
+                // identity fields, occurred_at and context.
+                XCTAssertEqual(actualEvent["event_type"], wanted["event_type"], at)
+                XCTAssertEqual(actualEvent["properties"], wanted["properties"], at)
+                continue
             }
+            if let expectedContext = wanted["context"]?.objectValue {
+                assertGovernedContext(context, expectedContext, at)
+            }
+            actualEvent.removeValue(forKey: "context")
+            actualEvent.removeValue(forKey: "occurred_at")
+            wanted.removeValue(forKey: "context")
+            bindings.assertMatches(.object(actualEvent), .object(wanted), at)
         }
     }
 
