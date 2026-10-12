@@ -51,8 +51,25 @@ public enum Whisperr {
     }
 
     /// Sends a Firebase Cloud Messaging registration token (`kind: fcm`).
-    public static func setPushToken(fcmToken: String) {
-        perform { try? await $0.setPushToken(fcmToken: fcmToken) }
+    /// Pass `firebaseProjectID` (`FirebaseApp.app()?.options.projectID`).
+    public static func setPushToken(fcmToken: String, firebaseProjectID: String? = nil) {
+        perform { try? await $0.setPushToken(fcmToken: fcmToken, firebaseProjectID: firebaseProjectID) }
+    }
+
+    /// Sends a OneSignal subscription id (`kind: onesignal_sub`). Pass
+    /// `oneSignalAppID`.
+    public static func setPushToken(oneSignalSubscriptionID: String, oneSignalAppID: String? = nil) {
+        perform {
+            try? await $0.setPushToken(oneSignalSubscriptionID: oneSignalSubscriptionID, oneSignalAppID: oneSignalAppID)
+        }
+    }
+
+    // MARK: - App language
+
+    /// Sets the language the user picked in your app (BCP 47, for example
+    /// `de` or `pt-BR`). See `WhisperrClient.setAppLanguage(_:)`.
+    public static func setAppLanguage(_ tag: String?) {
+        perform { await $0.setAppLanguage(tag) }
     }
 
     // MARK: - Permission
@@ -61,6 +78,14 @@ public enum Whisperr {
     /// only when it differs from the last status sent from this device.
     public static func pushPermissionChanged(_ status: WhisperrPushPermissionStatus) {
         perform { await $0.pushPermissionChanged(status) }
+    }
+
+    /// Asks the user for notification permission and reports the result.
+    /// With `provisional: true` iOS grants quiet delivery without a prompt.
+    /// Returns nil before `initialize` finishes or where the SDK cannot ask.
+    @discardableResult
+    public static func requestPushAuthorization(provisional: Bool = false) async -> WhisperrPushPermissionStatus? {
+        await storage.get()?.requestPushAuthorization(provisional: provisional)
     }
 
     /// Reads the notification permission (no prompt) and reports it. Call it
@@ -87,6 +112,21 @@ public enum Whisperr {
     @discardableResult
     public static func handleNotificationResponse(_ response: UNNotificationResponse) -> URL? {
         handle(WhisperrPushPayload(response: response))
+    }
+    #endif
+
+    #if canImport(UserNotifications) && !os(tvOS)
+    /// Call it from `userNotificationCenter(_:willPresent:withCompletionHandler:)`.
+    /// For a Whisperr notification it sends `push_received` (once per message
+    /// id, in the background) and returns true. You still call the
+    /// completion handler with the presentation options you want.
+    @discardableResult
+    public static func handleWillPresent(_ notification: UNNotification) -> Bool {
+        guard let payload = WhisperrPushPayload(notification: notification) else {
+            return false
+        }
+        perform { _ = try? await $0.trackPushReceived(payload) }
+        return true
     }
     #endif
 

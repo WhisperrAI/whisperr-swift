@@ -25,7 +25,9 @@ final class PushConformanceTests: XCTestCase {
     }
 
     private func run(_ cases: [PushCase]) async throws {
-        for testCase in cases {
+        // Contract v2 (v2.json anonymousPush) replaces some legacy flows.
+        let superseded = supersededCases(in: "push.json")
+        for testCase in cases where !superseded.contains(testCase.name) {
             let transport = MockTransport()
             let persistence = InMemoryWhisperrPersistence()
             var client = makeClient(transport: transport, persistence: persistence)

@@ -1,6 +1,63 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
+
+This is a minor release (0.5.0). It follows whisperr-spec contract v2. It
+needs the Whisperr backend that accepts `client_app_id`, `provider_project`
+and anonymous identifies; an older server answers `400`.
+
+- **Restore identify at start.** When the SDK has a stored user (and the user
+  did not opt out), it queues one identify at start: `external_user_id`,
+  `anonymous_id`, and the `timezone`, `locale` and `app_language` traits. No
+  channels. It waits 5 seconds (or until the first flush) and is skipped when
+  the app identifies a user first, or when the server got the same trait
+  values for this user less than 24 hours ago. It goes through the persisted
+  queue. Apps must still call `identify()` on session restore: the SDK cannot
+  know a user who signed in before the SDK install.
+- **`setAppLanguage(_:)`.** Sets the language the user picked in the app
+  (BCP 47; `_` becomes `-`; an invalid tag is ignored). Persisted, kept
+  across `reset()`. A new value is sent at once (partial identify, or an
+  anonymous identify before login). Every identify carries it as
+  `traits.app_language`; a caller value wins. `nil` clears it. Also on the
+  `Whisperr` facade.
+- **Anonymous push tokens.** `setPushToken` before `identify()` sends the
+  token at once in an anonymous identify (`anonymous_id` + push channel). The
+  dedupe pair is now (subject, token), where the subject is the user or the
+  anonymous id. `identify()` still attaches the token.
+- **`reset()` moves the token.** With a registered token, `reset()` opts it
+  out under the old user, rotates `anonymous_id`, and opts it in under the new
+  handle. While the permission is `denied`, the token stays held.
+- **Push token fields.** Every push entry carries `platform` (the device's,
+  unless you pass one) and `client_app_id` (the bundle id). A `kind: apns`
+  token always carries `push_env`. New `providerProject:` parameter on
+  `setPushToken(_:kind:platform:environment:providerProject:)`;
+  `setPushToken(fcmToken:firebaseProjectID:)`; new
+  `setPushToken(oneSignalSubscriptionID:oneSignalAppID:)`. No Firebase
+  dependency. `identify(pushToken:)` carries `platform` and `client_app_id`.
+- **Re-registration.** The same token is sent again when the last send is 7
+  days old or more. State from 0.4.x has no send time, so the next
+  `setPushToken` sends once.
+- **`push_opened`** carries `action_id` (`default` for a tap, else the action
+  button id) and `cold_start` (when the SDK can tell).
+- **`push_received`** (new reserved event): `handleWillPresent(_:)` and
+  `trackPushReceived(_:)` send it for a Whisperr push received in the
+  foreground, once per message id, with `whisperr_message_id`,
+  `foreground: true` and `source: "foreground"`. Not sent from the
+  Notification Service Extension.
+- **`requestPushAuthorization(provisional:)`** asks for permission (alert,
+  badge, sound, optionally provisional) and reports the result as
+  `push_permission_changed`.
+- **Versions on every event.** Every event carries `app_version`,
+  `app_build`, `platform`, `sdk_name` and `sdk_version` in `context`. A
+  caller key wins. `kWhisperrSdkName` is public.
+- **Fix: a flush could skip the drain.** A flush that started while an
+  earlier drain had just ended could return without sending what was queued
+  since. `close()` could then leave ops in the queue until the next launch.
+- **Conformance.** The spec runners execute the `v2.json` sections
+  `restoreIdentify`, `appLanguage`, `anonymousPush`, `pushRegistration` and
+  `versionContext`, and `automatic.json` `pushEventsV2` (except the
+  Notification Service Extension case). They skip the legacy cases these
+  sections supersede.
 
 - **Permission changes the push token.** A `denied` report (from
   `pushPermissionChanged(_:)` or the foreground read) sends one identify that

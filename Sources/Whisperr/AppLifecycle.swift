@@ -16,6 +16,13 @@ struct AppEnvironment: Sendable, Equatable {
     /// Nil only when a test harness models a runtime that cannot supply it.
     var osVersion: String?
     var platform: String
+    /// The bundle id, sent as a push token's `client_app_id`.
+    var clientAppID: String?
+    /// The push token `platform` of this device (nil where the spec has no
+    /// value for it).
+    var pushPlatform: WhisperrPushPlatform?
+    /// The APNs environment, sent as `push_env` with an APNs token.
+    var apnsEnvironment: WhisperrPushEnvironment?
 
     static func current(bundle: Bundle = .main) -> AppEnvironment {
         let info = bundle.infoDictionary ?? [:]
@@ -29,8 +36,31 @@ struct AppEnvironment: Sendable, Equatable {
             appBuild: nonEmpty(info["CFBundleVersion"] as? String),
             osName: osName,
             osVersion: osVersion,
-            platform: platform
+            platform: platform,
+            clientAppID: nonEmpty(bundle.bundleIdentifier),
+            pushPlatform: WhisperrPushPlatform.current,
+            apnsEnvironment: WhisperrPushEnvironment.current
         )
+    }
+
+    /// The keys every client event carries in `context` (whisperr-spec
+    /// SPEC.md → Versions on every event): `app_version`, `app_build`,
+    /// `platform`, `sdk_name`, `sdk_version`. A value the platform cannot
+    /// provide is omitted. Never `locale`: the server reads `context.locale`
+    /// as the message language of the event.
+    var eventContext: [String: JSONValue] {
+        var out: [String: JSONValue] = [
+            "platform": .string(platform),
+            "sdk_name": .string(kWhisperrSdkName),
+            "sdk_version": .string(kWhisperrSdkVersion)
+        ]
+        if let appVersion {
+            out["app_version"] = .string(appVersion)
+        }
+        if let appBuild {
+            out["app_build"] = .string(appBuild)
+        }
+        return out
     }
 
     /// The flat properties shared by all automatic events. A value the
@@ -39,7 +69,7 @@ struct AppEnvironment: Sendable, Equatable {
         var out: [String: JSONValue] = [
             "os_name": .string(osName),
             "platform": .string(platform),
-            "sdk_name": "whisperr-swift",
+            "sdk_name": .string(kWhisperrSdkName),
             "sdk_version": .string(kWhisperrSdkVersion)
         ]
         if let osVersion {
@@ -96,6 +126,47 @@ struct AppEnvironment: Sendable, Equatable {
     }
 }
 
+/// Whether the app has been active in this process, for `push_opened`
+/// `cold_start`. Read synchronously when a notification response arrives,
+/// because the tap and `didBecomeActive` race on a cold launch.
+final class WhisperrProcessActivity: @unchecked Sendable {
+    static let shared = WhisperrProcessActivity()
+
+    private let lock = NSLock()
+    private var tracking = false
+    private var hasBeenActive = false
+
+    /// Called when the SDK attaches to the app lifecycle.
+    func startTracking(isActive: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        tracking = true
+        if isActive {
+            hasBeenActive = true
+        }
+    }
+
+    func markActive() {
+        lock.lock()
+        defer { lock.unlock() }
+        hasBeenActive = true
+    }
+
+    /// True when an open now starts the app's UI for the first time in this
+    /// process. Before the SDK attaches to the lifecycle on a UIKit platform,
+    /// the app is still launching, so the answer is true. Nil where there is
+    /// no UIKit lifecycle (macOS, watchOS).
+    var coldStart: Bool? {
+        #if canImport(UIKit) && !os(watchOS)
+        lock.lock()
+        defer { lock.unlock() }
+        return tracking ? !hasBeenActive : true
+        #else
+        return nil
+        #endif
+    }
+}
+
 #if canImport(UIKit) && !os(watchOS)
 
 /// `UIApplication.shared` is unavailable in app extensions. Look it up at run
@@ -123,6 +194,13 @@ final class WhisperrLifecycleObserver: @unchecked Sendable {
 
     init(client: WhisperrClient) {
         let center = NotificationCenter.default
+        tokens.append(center.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            WhisperrProcessActivity.shared.markActive()
+        })
         tokens.append(center.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
             object: nil,

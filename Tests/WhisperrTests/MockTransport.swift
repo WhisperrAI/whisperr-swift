@@ -36,7 +36,16 @@ func makeClient(
     onError: (@Sendable (WhisperrError) -> Void)? = nil,
     // Device-trait defaults are environment-dependent and never pinned by the
     // spec fixtures; DeviceTraitsTests covers them on the real resolver.
-    deviceTraits: @escaping @Sendable () -> [String: JSONValue] = { [:] }
+    deviceTraits: @escaping @Sendable () -> [String: JSONValue] = { [:] },
+    // The environment keys (push platform, client_app_id, APNs environment)
+    // and the event context are silenced too, as the spec's conformance
+    // rules say; tests that pin them inject values.
+    environment: AppEnvironment = .silent,
+    environmentProvider: (@Sendable () -> AppEnvironment)? = nil,
+    eventContext: @escaping @Sendable () -> [String: JSONValue] = { [:] },
+    sleeper: @escaping @Sendable (TimeInterval) async -> Void = { _ in },
+    anonymousIDGenerator: (@Sendable () -> String)? = nil,
+    restoreDebounceFires: Bool = false
 ) -> WhisperrClient {
     let ids = IDSequence()
     return WhisperrClient(
@@ -57,8 +66,13 @@ func makeClient(
         transport: transport,
         clock: clock,
         idGenerator: { ids.next() },
-        sleeper: { _ in },
-        deviceTraits: deviceTraits
+        sleeper: restoreDebounce(sleeper, fires: restoreDebounceFires),
+        deviceTraits: deviceTraits,
+        appEnvironment: environmentProvider ?? { environment },
+        anonymousIDGenerator: anonymousIDGenerator,
+        installsLifecycleObserver: false,
+        pushPermissionProvider: { nil },
+        eventContext: eventContext
     )
 }
 
@@ -113,7 +127,9 @@ func makeLifecycleClient(
     automaticPushPermission: Bool = true,
     // nil: the permission cannot be read, so lifecycle tests see no
     // push_permission_changed unless they opt in.
-    pushPermission: @escaping @Sendable () async -> WhisperrPushPermissionStatus? = { nil }
+    pushPermission: @escaping @Sendable () async -> WhisperrPushPermissionStatus? = { nil },
+    pushAuthorization: @escaping @Sendable (Bool) async -> WhisperrPushPermissionStatus? = { _ in nil },
+    restoreDebounceFires: Bool = false
 ) -> WhisperrClient {
     let ids = IDSequence()
     let anonIDs = IDSequence()
@@ -134,16 +150,48 @@ func makeLifecycleClient(
         transport: transport,
         clock: { clock.now },
         idGenerator: { ids.next() },
-        sleeper: sleeper,
+        sleeper: restoreDebounce(sleeper, fires: restoreDebounceFires),
         deviceTraits: deviceTraits,
         appEnvironment: { environment },
         anonymousIDGenerator: { "anon-" + anonIDs.next() },
         installsLifecycleObserver: false,
-        pushPermissionProvider: pushPermission
+        pushPermissionProvider: pushPermission,
+        pushAuthorizationRequester: pushAuthorization
     )
 }
 
+/// By default the restore identify's start debounce never fires in tests, so
+/// the restore identify is queued at the first flush: request order stays
+/// deterministic. Tests of the debounce itself pass `fires: true`.
+func restoreDebounce(
+    _ sleeper: @escaping @Sendable (TimeInterval) async -> Void,
+    fires: Bool
+) -> @Sendable (TimeInterval) async -> Void {
+    { seconds in
+        if seconds == WhisperrClient.restoreIdentifyDelay, !fires {
+            try? await Task.sleep(nanoseconds: 3_600 * 1_000_000_000)
+            return
+        }
+        await sleeper(seconds)
+    }
+}
+
 extension AppEnvironment {
+    /// No app version, build, push platform, bundle id or APNs environment.
+    static let silent = AppEnvironment(appVersion: nil, appBuild: nil, osName: "ios", osVersion: nil, platform: "ios")
+
+    /// An iOS device with every environment value set.
+    static let device = AppEnvironment(
+        appVersion: "2.3.0",
+        appBuild: "230",
+        osName: "ios",
+        osVersion: "18.1",
+        platform: "ios",
+        clientAppID: "com.example.app",
+        pushPlatform: .ios,
+        apnsEnvironment: .sandbox
+    )
+
     static func fixture(version: String? = "1.2.0", build: String? = "42") -> AppEnvironment {
         AppEnvironment(
             appVersion: version,

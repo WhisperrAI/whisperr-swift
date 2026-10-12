@@ -201,6 +201,32 @@ enum WhisperrPushPermission {
         return nil
         #endif
     }
+
+    /// Asks the user for notification permission (`.alert`, `.badge`,
+    /// `.sound`, plus `.provisional` when `provisional` is true), then reads
+    /// the permission. Returns nil where it cannot ask: without
+    /// UserNotifications, on tvOS, or outside an app bundle.
+    static func request(provisional: Bool) async -> WhisperrPushPermissionStatus? {
+        #if canImport(UserNotifications) && !os(tvOS)
+        let path = Bundle.main.bundlePath
+        guard Bundle.main.bundleIdentifier != nil, path.hasSuffix(".app") else {
+            return nil
+        }
+        var options: UNAuthorizationOptions = [.alert, .badge, .sound]
+        if provisional {
+            options.insert(.provisional)
+        }
+        let requested = options
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            UNUserNotificationCenter.current().requestAuthorization(options: requested) { _, _ in
+                continuation.resume()
+            }
+        }
+        return await current()
+        #else
+        return nil
+        #endif
+    }
 }
 
 // MARK: - Payload
@@ -219,19 +245,38 @@ enum WhisperrPushPermission {
 public struct WhisperrPushPayload: Sendable, Equatable {
     /// Data keys the deep link may use, in order of preference.
     static let deepLinkKeys = ["whisperr_deep_link", "deep_link"]
+    /// `push_opened.action_id` for a tap on the notification itself.
+    public static let defaultActionID = "default"
 
     public let messageID: String
     /// The deep link string exactly as the payload carries it.
     public let deepLink: String?
+    /// The action the user picked: `default` for a tap on the notification,
+    /// or the identifier of a notification action button. Sent as
+    /// `push_opened.action_id`; nil sends `default`.
+    public let actionID: String?
+    /// True when this open launched the app's UI (a cold start). Sent as
+    /// `push_opened.cold_start`; nil sends no value.
+    public let coldStart: Bool?
 
-    public init(messageID: String, deepLink: String? = nil) {
+    public init(messageID: String, deepLink: String? = nil, actionID: String? = nil, coldStart: Bool? = nil) {
         self.messageID = messageID
         self.deepLink = deepLink
+        self.actionID = actionID
+        self.coldStart = coldStart
     }
 
     /// Returns nil when the notification was not sent by Whisperr (no
-    /// `whisperr_message_id`).
+    /// `whisperr_message_id`). `coldStart` is read from the app state now.
     public init?(userInfo: [AnyHashable: Any]) {
+        self.init(userInfo: userInfo, actionID: nil)
+    }
+
+    init?(userInfo: [AnyHashable: Any], actionID: String?) {
+        self.init(userInfo: userInfo, actionID: actionID, coldStart: WhisperrProcessActivity.shared.coldStart)
+    }
+
+    init?(userInfo: [AnyHashable: Any], actionID: String?, coldStart: Bool?) {
         let sources = Self.dataDictionaries(in: userInfo)
         guard let messageID = sources.lazy.compactMap({ Self.string($0["whisperr_message_id"]) }).first else {
             return nil
@@ -240,6 +285,8 @@ public struct WhisperrPushPayload: Sendable, Equatable {
         self.deepLink = Self.deepLinkKeys.lazy.compactMap { key in
             sources.lazy.compactMap { Self.string($0[key]) }.first
         }.first
+        self.actionID = actionID
+        self.coldStart = coldStart
     }
 
     /// The deep link as a URL, or nil when the payload has none or it is not
@@ -277,12 +324,23 @@ public struct WhisperrPushPayload: Sendable, Equatable {
 extension WhisperrPushPayload {
     /// Returns nil when the response is not a Whisperr notification, or when
     /// the user dismissed it (`UNNotificationDismissActionIdentifier`):
-    /// a dismissal is not an open.
+    /// a dismissal is not an open. A tap on the notification gives
+    /// `actionID` `default`; a button gives its action identifier.
     public init?(response: UNNotificationResponse) {
-        guard response.actionIdentifier != UNNotificationDismissActionIdentifier else {
+        let action = response.actionIdentifier
+        guard action != UNNotificationDismissActionIdentifier else {
             return nil
         }
-        self.init(userInfo: response.notification.request.content.userInfo)
+        self.init(
+            userInfo: response.notification.request.content.userInfo,
+            actionID: action == UNNotificationDefaultActionIdentifier ? Self.defaultActionID : action
+        )
+    }
+
+    /// Reads a notification that arrived while the app was in the
+    /// foreground (`userNotificationCenter(_:willPresent:withCompletionHandler:)`).
+    public init?(notification: UNNotification) {
+        self.init(userInfo: notification.request.content.userInfo, actionID: nil)
     }
 }
 #endif
