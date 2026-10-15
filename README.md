@@ -451,7 +451,9 @@ they enter the queue and are surfaced through `onError`.
   (with jitter); if retries exhaust, the queue is retained for the next flush.
 - A `Retry-After` header on `429` / `503` (seconds or an HTTP date) sets the
   wait before the next attempt, capped at 60 seconds.
-- Other `4xx` responses drop the offending operation and surface `dropped`.
+- Other `4xx` responses drop the offending operation and surface `dropped`
+  through `onError`. The first drop for each status code also prints a
+  warning, even with `debug` off; with `debug` on, every drop prints one.
 
 ## Options
 

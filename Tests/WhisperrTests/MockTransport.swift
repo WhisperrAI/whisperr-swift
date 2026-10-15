@@ -45,7 +45,9 @@ func makeClient(
     eventContext: @escaping @Sendable () -> [String: JSONValue] = { [:] },
     sleeper: @escaping @Sendable (TimeInterval) async -> Void = { _ in },
     anonymousIDGenerator: (@Sendable () -> String)? = nil,
-    restoreDebounceFires: Bool = false
+    restoreDebounceFires: Bool = false,
+    debug: Bool = false,
+    logger: (@Sendable (String) -> Void)? = nil
 ) -> WhisperrClient {
     let ids = IDSequence()
     return WhisperrClient(
@@ -58,6 +60,7 @@ func makeClient(
             retryBaseDelay: 0,
             maxRetryDelay: 0,
             enablePersistence: true,
+            debug: debug,
             // Spec conformance runs never include automatic events.
             automaticEvents: false,
             onError: onError
@@ -72,7 +75,8 @@ func makeClient(
         anonymousIDGenerator: anonymousIDGenerator,
         installsLifecycleObserver: false,
         pushPermissionProvider: { nil },
-        eventContext: eventContext
+        eventContext: eventContext,
+        logger: logger ?? { _ in }
     )
 }
 
@@ -99,6 +103,23 @@ final class ErrorRecorder: @unchecked Sendable {
     }
 
     var values: [WhisperrError] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+final class LineRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    func append(_ line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage.append(line)
+    }
+
+    var values: [String] {
         lock.lock()
         defer { lock.unlock() }
         return storage
