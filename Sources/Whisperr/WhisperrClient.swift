@@ -96,6 +96,9 @@ public actor WhisperrClient {
     private let installsLifecycleObserver: Bool
     private var lifecycleObserver: AnyObject?
     private var closed = false
+    private let logger: @Sendable (String) -> Void
+    /// Status codes whose drop was already logged with debug off.
+    private var warnedDropStatuses: Set<Int?> = []
     /// The one-time restore, shared so every entrant (start / flush /
     /// identify / setPushToken via ensureUsable) awaits the SAME in-flight
     /// restore instead of racing past a `started` flag before state is loaded.
@@ -148,7 +151,8 @@ public actor WhisperrClient {
 
     /// Full initializer. `appEnvironment`, `anonymousIDGenerator`,
     /// `installsLifecycleObserver`, `pushPermissionProvider`,
-    /// `pushAuthorizationRequester` and `eventContext` exist for tests only.
+    /// `pushAuthorizationRequester`, `eventContext` and `logger` exist for
+    /// tests only.
     init(
         apiKey: String,
         baseURL: URL,
@@ -164,9 +168,11 @@ public actor WhisperrClient {
         installsLifecycleObserver: Bool,
         pushPermissionProvider: (@Sendable () async -> WhisperrPushPermissionStatus?)? = nil,
         pushAuthorizationRequester: (@Sendable (Bool) async -> WhisperrPushPermissionStatus?)? = nil,
-        eventContext: (@Sendable () -> [String: JSONValue])? = nil
+        eventContext: (@Sendable () -> [String: JSONValue])? = nil,
+        logger: (@Sendable (String) -> Void)? = nil
     ) {
         self.options = options
+        self.logger = logger ?? { print($0) }
         self.persistence = options.enablePersistence
             ? (persistence ?? UserDefaultsWhisperrPersistence())
             : persistence
@@ -1357,6 +1363,7 @@ public actor WhisperrClient {
                     message: "dropped \(batch.count) operation(s) - rejected by server",
                     status: status
                 ))
+                warnDropped(status: status)
                 await forgetPushMark(batch) // registration rejected — let it re-send
                 await persist()
             case .auth(let status):
@@ -1679,8 +1686,23 @@ public actor WhisperrClient {
 
     private func log(_ message: String) {
         if options.debug {
-            print("[whisperr] \(message)")
+            logger("[whisperr] \(message)")
         }
+    }
+
+    /// A dropped request is gone for good, so say so even with debug off:
+    /// once per status code per client, so a misconfigured app does not flood
+    /// the console. With debug on, every drop is logged.
+    private func warnDropped(status: Int?) {
+        let first = warnedDropStatuses.insert(status).inserted
+        guard first || options.debug else {
+            return
+        }
+        let code = status.map { String($0) } ?? "a client error"
+        let later = options.debug
+            ? ""
+            : " Later rejections with this status are reported through onError, or here with debug on."
+        logger("[whisperr] dropped a request: the server rejected it with \(code).\(later)")
     }
 
     /// Exponential backoff with up to 30 % jitter, capped at `maxRetryDelay`.
