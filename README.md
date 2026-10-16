@@ -9,7 +9,7 @@ stable event idempotency.
 Add the package in Xcode or Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.5.0")
+.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.6.0")
 ```
 
 ## Quick Start
@@ -156,6 +156,11 @@ to "Does your signup get permission to email users?" in Whisperr:
 - **Yes:** the address is opted in unless you pass `emailOptedIn: false`.
 - **Per user:** only `emailOptedIn: true` opts it in.
 - **No:** the address gets no messages until your server confirms it.
+
+An earlier opt-out, including the unsubscribe link, is kept: a later identify
+from the app never opts the address back in. An address that another user in
+the app already holds stays pending. A new address can also stay pending when
+the app has reached its hourly limit of new email addresses from the app.
 
 If your app requires a server key for email (the stricter mode), only your
 backend can opt an address in, with the server key. Never put the server key
