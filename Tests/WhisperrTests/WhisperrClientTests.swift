@@ -28,11 +28,24 @@ final class WhisperrClientTests: XCTestCase {
             await client.flush()
 
             let requests = await transport.requests
-            XCTAssertEqual(
-                requests.first?.body.objectValue?["channels"],
-                [["channel": "email", "address": "ada@example.com", "opted_in": .bool(optedIn)]]
-            )
+            var expected: [String: JSONValue] = [
+                "channel": "email", "address": "ada@example.com", "opted_in": .bool(optedIn)
+            ]
+            if optedIn { expected["consent_source"] = "user" }
+            XCTAssertEqual(requests.first?.body.objectValue?["channels"], .array([.object(expected)]))
         }
+    }
+
+    func testOnlyAnOptedInEmailChannelCarriesConsentSource() {
+        XCTAssertEqual(
+            WhisperrChannel.email("a@b.co", optedIn: true).body,
+            ["channel": "email", "address": "a@b.co", "opted_in": true, "consent_source": "user"]
+        )
+        XCTAssertEqual(WhisperrChannel.email("a@b.co").body, ["channel": "email", "address": "a@b.co"])
+        XCTAssertEqual(
+            WhisperrChannel.sms("+15551234567", optedIn: true).body,
+            ["channel": "sms", "address": "+15551234567", "opted_in": true]
+        )
     }
 
     func testEmailOptedInWithoutEmailSendsNoChannel() async throws {
