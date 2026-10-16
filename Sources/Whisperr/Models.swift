@@ -109,6 +109,11 @@ public struct WhisperrChannel: Equatable, Sendable {
         if let optedIn {
             out["opted_in"] = .bool(optedIn)
         }
+        // The app's own consent answer, not an old SDK's default `true`
+        // (contract C1, "Per user" mode).
+        if type == .email, optedIn == true {
+            out["consent_source"] = "user"
+        }
         if let verified {
             out["verified"] = .bool(verified)
         }

@@ -3,7 +3,7 @@ import Foundation
 import UserNotifications
 #endif
 
-public let kWhisperrSdkVersion = "0.5.1"
+public let kWhisperrSdkVersion = "0.6.0"
 public let kWhisperrSdkName = "whisperr-swift"
 public let kWhisperrDefaultBaseURL = URL(string: "https://api.whisperr.net")!
 
@@ -497,10 +497,21 @@ public actor WhisperrClient {
     /// When the app does not, the SDK sends a restore identify for the stored
     /// user at start (see `start()`), but it cannot know a user who signed in
     /// before the SDK was installed.
+    ///
+    /// `email` claims no consent by itself. Pass `emailOptedIn` with your
+    /// user's answer: it is sent as `opted_in` on the email channel (`nil`:
+    /// no `opted_in`). Whether the address then gets messages depends on the
+    /// app's answer to "Does your signup get permission to email users?" in
+    /// Whisperr: with "Yes" it is opted in unless `emailOptedIn` is `false`;
+    /// with "Per user" only `emailOptedIn: true` opts it in; with "No" it gets
+    /// no messages until your server confirms it. If the app requires a server
+    /// key for email (the stricter mode), only your server can opt it in.
+    /// `emailOptedIn` is ignored without `email`.
     public func identify(
         _ externalUserID: String,
         traits: [String: JSONValue] = [:],
         email: String? = nil,
+        emailOptedIn: Bool? = nil,
         phone: String? = nil,
         pushToken: String? = nil,
         preferredChannel: WhisperrChannelType? = nil,
@@ -535,6 +546,7 @@ public actor WhisperrClient {
 
         var resolvedChannels = buildChannels(
             email: email,
+            emailOptedIn: emailOptedIn,
             phone: phone,
             pushToken: pushToken,
             explicit: channels
@@ -1584,13 +1596,14 @@ public actor WhisperrClient {
 
     private func buildChannels(
         email: String?,
+        emailOptedIn: Bool?,
         phone: String?,
         pushToken: String?,
         explicit: [WhisperrChannel]
     ) -> [WhisperrChannel] {
         var out: [WhisperrChannel] = []
         if let value = trimmedNonEmpty(email) {
-            out.append(.email(value, optedIn: true))
+            out.append(.email(value, optedIn: emailOptedIn))
         }
         if let value = trimmedNonEmpty(phone) {
             out.append(.sms(value, optedIn: true))
