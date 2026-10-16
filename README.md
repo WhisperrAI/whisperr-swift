@@ -149,7 +149,7 @@ Shortcut `phone` and `pushToken` values expand to opted-in channels. The
 try await whisperr.identify("user_123", email: "ada@example.com", emailOptedIn: true)
 ```
 
-`emailOptedIn` is sent as `opted_in` on the email channel; omit it and nothing
+`emailOptedIn` needs 0.6.0 or later. It is sent as `opted_in` on the email channel; omit it and nothing
 is sent. Whether the address then gets messages depends on your app's answer
 to "Does your signup get permission to email users?" in Whisperr:
 

@@ -3,7 +3,7 @@ import Foundation
 import UserNotifications
 #endif
 
-public let kWhisperrSdkVersion = "0.5.1"
+public let kWhisperrSdkVersion = "0.6.0"
 public let kWhisperrSdkName = "whisperr-swift"
 public let kWhisperrDefaultBaseURL = URL(string: "https://api.whisperr.net")!
 

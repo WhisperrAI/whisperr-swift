@@ -41,7 +41,7 @@ final class WireConformanceTests: XCTestCase {
                 }
             } else {
                 let body = try XCTUnwrap(request.body.objectValue)
-                for (key, expected) in Self.withKnownDivergences(testCase.name, testCase.expectedBody ?? [:]) {
+                for (key, expected) in Self.withKnownDivergences(testCase, testCase.expectedBody ?? [:]) {
                     XCTAssertEqual(body[key], expected, "\(testCase.name).\(key)")
                 }
             }
@@ -80,6 +80,7 @@ final class WireConformanceTests: XCTestCase {
             externalUserID,
             traits: scenario["traits"]?.objectValue ?? [:],
             email: scenario["email"]?.stringValue,
+            emailOptedIn: scenario["emailOptedIn"]?.boolValue,
             phone: scenario["phone"]?.stringValue,
             pushToken: scenario["pushToken"]?.stringValue,
             preferredChannel: scenario["preferredChannel"]?.stringValue.flatMap(WhisperrChannelType.init(rawValue:)),
@@ -93,10 +94,12 @@ final class WireConformanceTests: XCTestCase {
     /// SDK leaves `opted_in` off the email channel instead of sending `true`.
     /// Idempotent, so this stays correct once the fixture drops `opted_in`.
     private static func withKnownDivergences(
-        _ name: String,
+        _ testCase: WireCase,
         _ expected: [String: JSONValue]
     ) -> [String: JSONValue] {
-        guard name == "identify_email_shortcut", let channels = expected["channels"]?.arrayValue else {
+        guard testCase.name == "identify_email_shortcut",
+              testCase.scenario["emailOptedIn"] == nil,
+              let channels = expected["channels"]?.arrayValue else {
             return expected
         }
         var out = expected
