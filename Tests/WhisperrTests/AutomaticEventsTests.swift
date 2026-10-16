@@ -581,8 +581,9 @@ final class RetryAfterTests: XCTestCase {
 
 final class EmailShortcutTests: XCTestCase {
     /// Report 14 B1: the shortcut must not mark the address unverified. It
-    /// sends no `verified` key (SPEC.md: "omit unless set"); an explicit value
-    /// from the caller is kept.
+    /// sends no `verified` key (SPEC.md: "omit unless set"), and without
+    /// `emailOptedIn` no `opted_in` key (contract C1); an explicit value from
+    /// the caller is kept.
     func testEmailShortcutOmitsVerifiedAndExplicitValueIsKept() async throws {
         let transport = MockTransport()
         let client = makeClient(transport: transport)
@@ -593,7 +594,7 @@ final class EmailShortcutTests: XCTestCase {
 
         let channels = await transport.requests.map { $0.body.objectValue?["channels"] }
         XCTAssertEqual(channels, [
-            [["channel": "email", "address": "ada@example.com", "opted_in": true]],
+            [["channel": "email", "address": "ada@example.com"]],
             [["channel": "email", "address": "ada@example.com", "verified": false]]
         ])
     }

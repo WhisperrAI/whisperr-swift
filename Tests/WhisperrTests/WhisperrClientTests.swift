@@ -15,8 +15,36 @@ final class WhisperrClientTests: XCTestCase {
         XCTAssertEqual(requests[0].body.objectValue?["external_user_id"], "user_123")
         XCTAssertEqual(
             requests[0].body.objectValue?["channels"],
-            [["channel": "email", "address": "ada@example.com", "opted_in": true]]
+            [["channel": "email", "address": "ada@example.com"]]
         )
+    }
+
+    func testEmailOptedInIsSentAsOptedInOnTheEmailShortcut() async throws {
+        for optedIn in [true, false] {
+            let transport = MockTransport()
+            let client = makeClient(transport: transport)
+
+            try await client.identify("user_123", email: "ada@example.com", emailOptedIn: optedIn)
+            await client.flush()
+
+            let requests = await transport.requests
+            XCTAssertEqual(
+                requests.first?.body.objectValue?["channels"],
+                [["channel": "email", "address": "ada@example.com", "opted_in": .bool(optedIn)]]
+            )
+        }
+    }
+
+    func testEmailOptedInWithoutEmailSendsNoChannel() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport: transport)
+
+        try await client.identify("user_123", emailOptedIn: true)
+        await client.flush()
+
+        let requests = await transport.requests
+        XCTAssertEqual(requests.first?.path, "/v1/identify")
+        XCTAssertNil(requests.first?.body.objectValue?["channels"])
     }
 
     func testTrackAddsStableMessageIDAndDropsInvalidEventType() async throws {

@@ -41,7 +41,7 @@ final class WireConformanceTests: XCTestCase {
                 }
             } else {
                 let body = try XCTUnwrap(request.body.objectValue)
-                for (key, expected) in testCase.expectedBody ?? [:] {
+                for (key, expected) in Self.withKnownDivergences(testCase.name, testCase.expectedBody ?? [:]) {
                     XCTAssertEqual(body[key], expected, "\(testCase.name).\(key)")
                 }
             }
@@ -85,6 +85,29 @@ final class WireConformanceTests: XCTestCase {
             preferredChannel: scenario["preferredChannel"]?.stringValue.flatMap(WhisperrChannelType.init(rawValue:)),
             channels: channels
         )
+    }
+
+    /// Deliberate, documented departure from the spec fixture while the spec
+    /// catches up (contract C1, client email consent): the `email` shortcut
+    /// claims no consent on the user's behalf, so without `emailOptedIn` the
+    /// SDK leaves `opted_in` off the email channel instead of sending `true`.
+    /// Idempotent, so this stays correct once the fixture drops `opted_in`.
+    private static func withKnownDivergences(
+        _ name: String,
+        _ expected: [String: JSONValue]
+    ) -> [String: JSONValue] {
+        guard name == "identify_email_shortcut", let channels = expected["channels"]?.arrayValue else {
+            return expected
+        }
+        var out = expected
+        out["channels"] = .array(channels.map { channel -> JSONValue in
+            guard var fields = channel.objectValue, fields["channel"] == .string("email") else {
+                return channel
+            }
+            fields.removeValue(forKey: "opted_in")
+            return .object(fields)
+        })
+        return out
     }
 
     private static func rfc3339MillisecondsRegex() -> NSRegularExpression {

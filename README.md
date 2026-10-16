@@ -136,9 +136,30 @@ anonymously before login). Every later `identify()` carries it as
 `traits.app_language`; a `traits["app_language"]` you pass wins. The same
 value again sends nothing. `setAppLanguage(nil)` clears the stored value.
 
-Shortcut `email`, `phone`, and `pushToken` values expand to opted-in channels.
-Use explicit `WhisperrChannel` values when you need consent or verification
-control.
+Shortcut `phone` and `pushToken` values expand to opted-in channels. The
+`email` shortcut claims no consent: see "Email consent" below. Use explicit
+`WhisperrChannel` values when you need consent or verification control.
+
+### Email consent
+
+`identify(_:email:)` stores the address and claims no consent. Pass
+`emailOptedIn` with your user's answer when you have it:
+
+```swift
+try await whisperr.identify("user_123", email: "ada@example.com", emailOptedIn: true)
+```
+
+`emailOptedIn` is sent as `opted_in` on the email channel; omit it and nothing
+is sent. Whether the address then gets messages depends on your app's answer
+to "Does your signup get permission to email users?" in Whisperr:
+
+- **Yes:** the address is opted in unless you pass `emailOptedIn: false`.
+- **Per user:** only `emailOptedIn: true` opts it in.
+- **No:** the address gets no messages until your server confirms it.
+
+If your app requires a server key for email (the stricter mode), only your
+backend can opt an address in, with the server key. Never put the server key
+in your app.
 
 ## Push notifications
 
