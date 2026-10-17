@@ -617,7 +617,9 @@ final class PrivacyManifestTests: XCTestCase {
             [
                 "NSPrivacyCollectedDataTypeUserID",
                 "NSPrivacyCollectedDataTypeDeviceID",
-                "NSPrivacyCollectedDataTypeProductInteraction"
+                "NSPrivacyCollectedDataTypeProductInteraction",
+                "NSPrivacyCollectedDataTypeCrashData",
+                "NSPrivacyCollectedDataTypeOtherDiagnosticData"
             ]
         )
         for entry in collected {

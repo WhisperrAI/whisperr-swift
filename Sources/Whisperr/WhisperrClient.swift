@@ -3,7 +3,7 @@ import Foundation
 import UserNotifications
 #endif
 
-public let kWhisperrSdkVersion = "0.6.0"
+public let kWhisperrSdkVersion = "0.7.0"
 public let kWhisperrSdkName = "whisperr-swift"
 public let kWhisperrDefaultBaseURL = URL(string: "https://api.whisperr.net")!
 
@@ -62,6 +62,8 @@ public actor WhisperrClient {
     private var pushPermissionStatus: String?
     private let pushPermissionProvider: @Sendable () async -> WhisperrPushPermissionStatus?
     private let pushAuthorizationRequester: @Sendable (Bool) async -> WhisperrPushPermissionStatus?
+    /// Reads the notification settings sent with push_permission_changed.
+    private let pushPermissionDetails: @Sendable () async -> [String: JSONValue]
     /// The keys every event carries in `context` (C5). Injectable so
     /// conformance runs can silence them.
     private let eventContext: @Sendable () -> [String: JSONValue]
@@ -87,8 +89,45 @@ public actor WhisperrClient {
     private var pushOpensInFlight: Set<String> = []
     /// Push message ids already reported as opened (most recent last). Persisted.
     private var openedPushMessageIDs: [String] = []
-    /// Start of the current foreground period, for app_backgrounded.foreground_ms.
-    private var foregroundSince: Date?
+    /// Start of the current foreground period on the monotonic clock, for
+    /// app_backgrounded.foreground_ms.
+    private var foregroundSince: TimeInterval?
+    /// Monotonic seconds (`ProcessInfo.systemUptime`); injectable for tests.
+    private let uptime: @Sendable () -> TimeInterval
+    /// `context.session_id` of every event: `sess_<uuid>`, new in each process
+    /// and after `sessionIdleTimeout` without an event. In memory only.
+    private var sessionID: String?
+    private var sessionLastEventAt: Date?
+    private var sessionLastEventUptime: TimeInterval?
+    /// app_error dedupe and cap, per session.
+    private var sessionErrorFingerprints: Set<String> = []
+    private var sessionErrorsSent = 0
+    /// Counters of the current foreground visit, for app_backgrounded.
+    private var visit = WhisperrVisitCounters()
+    /// The last screen_viewed name, for app_error.screen_name.
+    private var lastScreenName: String?
+    /// The queued app_opened that a launch signal (push, link) can still
+    /// attribute, until `attributionDeadline` (monotonic) or the next flush.
+    private var attributionOpID: String?
+    private var attributionDeadline: TimeInterval?
+    private var attributionRank = 0
+    /// A push or link that arrived while no app_opened was waiting (the
+    /// launch was still running). The next app_opened takes it when it is
+    /// queued within `attributionWindow` of the signal.
+    private var pendingLaunch: (signal: WhisperrLaunchSignal, at: TimeInterval)?
+    /// Counts moves to the background, so an app_opened that finishes after
+    /// the app already left the foreground sets no run marker.
+    private var backgroundCount = 0
+    /// The notification settings last read in this process, so a change of a
+    /// setting alone also sends push_permission_changed.
+    private var lastPushPermissionDetails: [String: JSONValue]?
+    /// Set when app_updated is sent; the next app_opened carries
+    /// first_after_update.
+    private var pendingFirstAfterUpdate = false
+    /// The unclean-shutdown flag behind app_crashed.
+    private let runMarkers: WhisperrRunMarkerStore
+    /// Debug builds never send app_crashed. Injectable for tests.
+    private let isDebugBuild: Bool
     /// The first app_opened of this process is the cold start.
     private var hasOpenedInProcess = false
     private let appEnvironment: @Sendable () -> AppEnvironment
@@ -169,7 +208,11 @@ public actor WhisperrClient {
         pushPermissionProvider: (@Sendable () async -> WhisperrPushPermissionStatus?)? = nil,
         pushAuthorizationRequester: (@Sendable (Bool) async -> WhisperrPushPermissionStatus?)? = nil,
         eventContext: (@Sendable () -> [String: JSONValue])? = nil,
-        logger: (@Sendable (String) -> Void)? = nil
+        logger: (@Sendable (String) -> Void)? = nil,
+        uptime: (@Sendable () -> TimeInterval)? = nil,
+        runMarkers: WhisperrRunMarkerStore? = nil,
+        isDebugBuild: Bool? = nil,
+        pushPermissionDetails: (@Sendable () async -> [String: JSONValue])? = nil
     ) {
         self.options = options
         self.logger = logger ?? { print($0) }
@@ -197,7 +240,25 @@ public actor WhisperrClient {
         self.pushAuthorizationRequester = pushAuthorizationRequester ?? { provisional in
             await WhisperrPushPermission.request(provisional: provisional)
         }
+        self.uptime = uptime ?? { ProcessInfo.processInfo.systemUptime }
+        self.pushPermissionDetails = pushPermissionDetails ?? { await WhisperrPushPermission.currentDetails() }
+        // Without persistence a crash cannot be told at the next launch.
+        let persists = options.enablePersistence || persistence != nil
+        self.runMarkers = runMarkers ?? (persists ? WhisperrRunMarkerStore(defaults: .standard) : .inMemory())
+        #if DEBUG
+        self.isDebugBuild = isDebugBuild ?? true
+        #else
+        self.isDebugBuild = isDebugBuild ?? false
+        #endif
     }
+
+    /// A session ends after this long without an event.
+    static let sessionIdleTimeout: TimeInterval = 30 * 60
+    /// How long after a move to the foreground a push or link can still
+    /// attribute that app_opened.
+    static let attributionWindow: TimeInterval = 1.5
+    /// At most this many app_error per session.
+    static let maxErrorsPerSession = 20
 
     deinit {
         flushLoop?.cancel()
@@ -255,6 +316,9 @@ public actor WhisperrClient {
         flushLoop?.cancel()
         flushLoop = nil
         lifecycleObserver = nil
+        #if canImport(ObjectiveC)
+        WhisperrErrorCapture.shared.detach(self)
+        #endif
     }
 
     // MARK: - Opt-out
@@ -328,6 +392,11 @@ public actor WhisperrClient {
     /// events) and records the launch. No-op on platforms without
     /// `UIApplication` and inside app extensions.
     private func attachLifecycle() async {
+        #if canImport(ObjectiveC)
+        if installsLifecycleObserver, options.captureErrors, options.automaticEvents, !closed {
+            WhisperrErrorCapture.shared.attach(self, runMarkers: runMarkers)
+        }
+        #endif
         #if canImport(UIKit) && !os(watchOS)
         guard installsLifecycleObserver, lifecycleObserver == nil, !closed else {
             return
@@ -356,6 +425,7 @@ public actor WhisperrClient {
         }
         await start() // persisted state (seen version, user, opt-out) first
         await recordAppVersion()
+        await reportPreviousRun()
         if inForeground {
             await appOpened()
             await refreshPushPermissionIfAutomatic()
@@ -378,28 +448,294 @@ public actor WhisperrClient {
         guard !closed else {
             return
         }
+        backgroundCount += 1
         await start() // persisted state (seen version, user, opt-out) first
         let since = foregroundSince
         foregroundSince = nil
+        let counters = visit
+        visit = WhisperrVisitCounters()
+        attributionOpID = nil
+        // A clean move to the background: no crash to report next launch.
+        runMarkers.save(nil)
         if options.automaticEvents {
-            var properties: [String: JSONValue] = [:]
+            var properties: [String: JSONValue] = [
+                "screen_count": .number(Double(counters.screens)),
+                "unique_screen_count": .number(Double(counters.uniqueScreens.count)),
+                "event_count": .number(Double(counters.events)),
+                "error_count": .number(Double(counters.errors))
+            ]
             if let since {
-                let elapsed = max(0, clock().timeIntervalSince(since))
+                let elapsed = max(0, uptime() - since)
                 properties["foreground_ms"] = .number((elapsed * 1_000).rounded())
+            }
+            if !optedOut {
+                properties["session_id"] = .string(touchSession())
             }
             await trackAutomatic("app_backgrounded", properties)
         }
         await flush()
     }
 
+    /// Sends app_opened with `launch_source: direct` (and `cold_start`,
+    /// `first_after_update`). A push or link that arrives within
+    /// `attributionWindow`, before the event leaves the queue, sets its
+    /// launch source.
     private func appOpened() async {
-        foregroundSince = clock()
+        let generation = backgroundCount
+        foregroundSince = uptime()
+        visit = WhisperrVisitCounters()
         let coldStart = !hasOpenedInProcess
         hasOpenedInProcess = true
-        guard options.automaticEvents else {
+        let firstAfterUpdate = pendingFirstAfterUpdate
+        pendingFirstAfterUpdate = false
+        if options.automaticEvents {
+            var properties: [String: JSONValue] = [
+                "cold_start": .bool(coldStart),
+                "launch_source": .string(WhisperrLaunchSource.direct.rawValue)
+            ]
+            if firstAfterUpdate {
+                properties["first_after_update"] = .bool(true)
+            }
+            if let id = await trackAutomatic("app_opened", properties) {
+                attributionOpID = id
+                attributionDeadline = uptime() + Self.attributionWindow
+                attributionRank = WhisperrLaunchSource.direct.rank
+                await applyPendingLaunch()
+            }
+        }
+        // The app went to the background while this open was queued.
+        guard backgroundCount == generation else {
             return
         }
-        await trackAutomatic("app_opened", ["cold_start": .bool(coldStart)])
+        runMarkers.save(WhisperrRunMarker(
+            sessionID: sessionID,
+            screen: lastScreenName,
+            appVersion: appEnvironment().appVersion,
+            fatal: nil
+        ))
+    }
+
+    /// Gives the app_opened just queued the signal that arrived before it,
+    /// and moves that push's push_opened behind it.
+    private func applyPendingLaunch() async {
+        guard let pending = pendingLaunch else {
+            return
+        }
+        pendingLaunch = nil
+        guard uptime() - pending.at <= Self.attributionWindow else {
+            return
+        }
+        await resolveLaunch(pending.signal)
+        guard pending.signal.source == .push,
+              let messageID = pending.signal.properties["whisperr_message_id"],
+              let openedIndex = queue.firstIndex(where: { $0.id == attributionOpID }),
+              let pushIndex = queue.firstIndex(where: {
+                  $0.body["event_type"] == "push_opened"
+                      && $0.body["properties"]?.objectValue?["whisperr_message_id"] == messageID
+              }),
+              pushIndex < openedIndex else {
+            return
+        }
+        let pushOpened = queue.remove(at: pushIndex)
+        queue.insert(pushOpened, at: openedIndex)
+        await persist()
+    }
+
+    /// Sets the launch source of the app_opened still waiting in the queue,
+    /// when `signal` outranks the one it has. With no app_opened waiting, the
+    /// signal is kept for the next one (see `pendingLaunch`).
+    private func resolveLaunch(_ signal: WhisperrLaunchSignal) async {
+        let now = uptime()
+        guard let id = attributionOpID,
+              let deadline = attributionDeadline,
+              now <= deadline,
+              let index = queue.firstIndex(where: { $0.id == id }) else {
+            if let pending = pendingLaunch,
+               now - pending.at <= Self.attributionWindow,
+               pending.signal.source.rank >= signal.source.rank {
+                return
+            }
+            pendingLaunch = (signal, now)
+            return
+        }
+        guard signal.source.rank > attributionRank,
+              case .object(var properties)? = queue[index].body["properties"] else {
+            return
+        }
+        for key in WhisperrLaunchSignal.keys {
+            properties.removeValue(forKey: key)
+        }
+        for (key, value) in signal.properties {
+            properties[key] = value
+        }
+        properties["launch_source"] = .string(signal.source.rawValue)
+        queue[index].body["properties"] = .object(properties)
+        attributionRank = signal.source.rank
+        await persist()
+    }
+
+    /// Reports a launch from a link: a custom-scheme deep link, a universal
+    /// link, or a link with `wsrc=widget` / `wsrc=shortcut`. Call it from
+    /// `application(_:open:options:)`, `scene(_:openURLContexts:)` or
+    /// SwiftUI `.onOpenURL`. It sets `launch_source` on the `app_opened` of
+    /// this move to the foreground; it sends no event of its own. Only the
+    /// path (identifiers replaced by `:id`), the host of an http(s) link and
+    /// `utm_*` values are kept.
+    public nonisolated func handleOpenURL(_ url: URL) {
+        Task { await self.recordLaunchURL(url) }
+    }
+
+    /// Reports a launch from a universal link. Call it from
+    /// `application(_:continue:restorationHandler:)`,
+    /// `scene(_:continue:)` or SwiftUI `.onContinueUserActivity`. Activities
+    /// other than web browsing are ignored.
+    #if canImport(ObjectiveC)
+    public nonisolated func handleUserActivity(_ activity: NSUserActivity) {
+        guard activity.activityType == NSUserActivityTypeBrowsingWeb, let url = activity.webpageURL else {
+            return
+        }
+        handleOpenURL(url)
+    }
+    #endif
+
+    func recordLaunchURL(_ url: URL) async {
+        guard !closed, let signal = WhisperrLaunchSignal.link(url) else {
+            return
+        }
+        await start()
+        await resolveLaunch(signal)
+    }
+
+    /// The app stopped being active (app switcher, Control Center, a call):
+    /// a kill from here is not a crash. Synchronous, from the UIKit observer.
+    nonisolated func handleWillResignActive() {
+        runMarkers.park()
+    }
+
+    nonisolated func handleDidBecomeActive() {
+        runMarkers.unpark()
+    }
+
+    nonisolated func handleWillTerminate() {
+        runMarkers.save(nil)
+    }
+
+    /// Sends app_crashed when the last run ended in the foreground (the run
+    /// marker is still set), before this launch's app_opened. Never in debug
+    /// builds.
+    private func reportPreviousRun() async {
+        guard let marker = runMarkers.load() else {
+            return
+        }
+        runMarkers.save(nil)
+        guard options.automaticEvents, !isDebugBuild else {
+            return
+        }
+        let fatal = marker.fatal == true
+        var properties: [String: JSONValue] = [
+            "crash_kind": .string(fatal ? "crash" : "abnormal_exit"),
+            "detected_by": .string(fatal ? "native_exception" : "unclean_shutdown"),
+            "foreground": .bool(true)
+        ]
+        if let version = marker.appVersion {
+            properties["crashed_app_version"] = .string(version)
+        }
+        if let session = marker.sessionID {
+            properties["crashed_session_id"] = .string(session)
+        }
+        if let screen = marker.screen {
+            properties["crashed_screen_name"] = .string(screen)
+        }
+        await trackAutomatic("app_crashed", properties)
+    }
+
+    /// The current session id, rolled after `sessionIdleTimeout` without an
+    /// event. Every call counts as an event. The gap is measured on both the
+    /// wall clock and the monotonic clock, and either one rolls the session:
+    /// `systemUptime` stops while the device sleeps, and the wall clock can
+    /// be set back.
+    private func touchSession() -> String {
+        let now = clock()
+        let nowUptime = uptime()
+        if let id = sessionID, let last = sessionLastEventAt, let lastUptime = sessionLastEventUptime,
+           now.timeIntervalSince(last) < Self.sessionIdleTimeout,
+           nowUptime - lastUptime < Self.sessionIdleTimeout {
+            sessionLastEventAt = now
+            sessionLastEventUptime = nowUptime
+            return id
+        }
+        let id = WhisperrSignals.newSessionID()
+        sessionID = id
+        sessionLastEventAt = now
+        sessionLastEventUptime = nowUptime
+        sessionErrorFingerprints = []
+        sessionErrorsSent = 0
+        runMarkers.update { $0.sessionID = id }
+        return id
+    }
+
+    // MARK: - Errors
+
+    /// Reports an error your app handled as `app_error`: its type name
+    /// (never the message), a fingerprint, the screen (`screen`, else the last
+    /// `screen_viewed`) and `kind` (`handled` by default). At most one per
+    /// fingerprint and 20 per session; `app_backgrounded.error_count` still
+    /// counts every call. It does not flush on its own.
+    public func trackError(_ error: Error, screen: String? = nil, kind: WhisperrErrorKind = .handled) async {
+        await recordError(
+            name: WhisperrSignals.errorName(error),
+            frames: [],
+            kind: kind.rawValue,
+            fatal: false,
+            screen: screen
+        )
+    }
+
+    /// An uncaught error from the exception handler.
+    func handleUncaughtError(name: String, frames: [String], fatal: Bool) async {
+        guard options.captureErrors, options.automaticEvents else {
+            return
+        }
+        if fatal {
+            runMarkers.markFatal()
+        }
+        await recordError(name: name, frames: frames, kind: WhisperrErrorKind.native.rawValue, fatal: fatal, screen: nil)
+    }
+
+    func recordError(name: String, frames: [String], kind: String, fatal: Bool, screen: String?) async {
+        guard !closed else {
+            return
+        }
+        await start()
+        guard !optedOut else {
+            return
+        }
+        visit.errors += 1
+        let session = touchSession()
+        let errorName = WhisperrSignals.truncate(name, 64)
+        let fingerprint = WhisperrSignals.fingerprint(name: errorName, frames: frames)
+        guard sessionErrorsSent < Self.maxErrorsPerSession,
+              !sessionErrorFingerprints.contains(fingerprint) else {
+            return
+        }
+        sessionErrorFingerprints.insert(fingerprint)
+        sessionErrorsSent += 1
+        var properties: [String: JSONValue] = [
+            "error_kind": .string(kind),
+            "fatal": .bool(fatal),
+            "error_name": .string(errorName),
+            "fingerprint": .string(fingerprint),
+            "session_id": .string(session)
+        ]
+        if let screenName = trimmedNonEmpty(screen) ?? lastScreenName {
+            properties["screen_name"] = .string(screenName)
+        }
+        _ = try? await record(
+            "app_error",
+            properties: withAutomaticProperties(properties),
+            origin: .automatic,
+            autoFlush: false
+        )
     }
 
     /// Compares the running app version with the one stored at the last
@@ -440,6 +776,7 @@ public actor WhisperrClient {
                     properties["previous_build"] = .string(previousBuild)
                 }
                 await trackAutomatic("app_updated", properties)
+                pendingFirstAfterUpdate = true
             }
         }
         await persist()
@@ -472,8 +809,9 @@ public actor WhisperrClient {
         return merged
     }
 
-    private func trackAutomatic(_ eventType: String, _ properties: [String: JSONValue]) async {
-        try? await track(eventType, properties: withAutomaticProperties(properties))
+    @discardableResult
+    private func trackAutomatic(_ eventType: String, _ properties: [String: JSONValue]) async -> String? {
+        try? await record(eventType, properties: withAutomaticProperties(properties), origin: .automatic)
     }
 
     /// Identifies the current user and persists traits/contact channels.
@@ -891,9 +1229,30 @@ public actor WhisperrClient {
         context: [String: JSONValue] = [:],
         userID: String? = nil
     ) async throws {
+        try await record(eventType, properties: properties, context: context, userID: userID, origin: .customer)
+    }
+
+    private enum EventOrigin {
+        /// `track()` from the app: counts in app_backgrounded.event_count.
+        case customer
+        /// An event the SDK sends (reserved names).
+        case automatic
+    }
+
+    /// Queues an event and returns its message id, or nil when nothing was
+    /// queued.
+    @discardableResult
+    private func record(
+        _ eventType: String,
+        properties: [String: JSONValue],
+        context: [String: JSONValue] = [:],
+        userID: String? = nil,
+        origin: EventOrigin,
+        autoFlush: Bool = true
+    ) async throws -> String? {
         try await ensureUsable()
         guard !optedOut else {
-            return
+            return nil
         }
         let resolvedUserID = (userID ?? currentUserID)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -908,7 +1267,7 @@ public actor WhisperrClient {
                 message: "invalid event_type \"\(type)\" - expected snake_case"
             ))
             log("invalid event_type \"\(type)\" - event was not queued")
-            return
+            return nil
         }
 
         let messageID = idGenerator()
@@ -919,6 +1278,7 @@ public actor WhisperrClient {
             mergedContext[key] = value
         }
         mergedContext["$message_id"] = .string(messageID)
+        mergedContext["session_id"] = .string(touchSession())
 
         var body: [String: JSONValue] = [
             "event_type": .string(type),
@@ -936,7 +1296,11 @@ public actor WhisperrClient {
             id: messageID,
             kind: .track,
             body: body
-        ))
+        ), autoFlush: autoFlush)
+        if origin == .customer {
+            visit.events += 1
+        }
+        return messageID
     }
 
     /// Sends a `screen_viewed` event with `screen_name`. Call it when a screen
@@ -949,7 +1313,13 @@ public actor WhisperrClient {
         }
         var merged = properties
         merged["screen_name"] = .string(trimmed)
-        try await track("screen_viewed", properties: withAutomaticProperties(merged))
+        guard try await record("screen_viewed", properties: withAutomaticProperties(merged), origin: .automatic) != nil else {
+            return
+        }
+        lastScreenName = trimmed
+        visit.screens += 1
+        visit.uniqueScreens.insert(trimmed)
+        runMarkers.update { $0.screen = trimmed }
     }
 
     /// Reports that the user opened a Whisperr push notification: sends
@@ -992,9 +1362,11 @@ public actor WhisperrClient {
         }
         pushOpensInFlight.insert(payload.messageID)
         defer { pushOpensInFlight.remove(payload.messageID) }
+        // A tap that opened the app: that app_opened has launch_source push.
+        await resolveLaunch(.push(messageID: payload.messageID))
         // Mark the id as sent only after the event is in the persisted queue.
         // If track throws (client closed), the id stays unmarked.
-        try await track("push_opened", properties: withAutomaticProperties(properties))
+        try await record("push_opened", properties: withAutomaticProperties(properties), origin: .automatic)
         openedPushMessageIDs.append(payload.messageID)
         if openedPushMessageIDs.count > Self.maxRememberedPushOpens {
             openedPushMessageIDs.removeFirst(openedPushMessageIDs.count - Self.maxRememberedPushOpens)
@@ -1028,7 +1400,7 @@ public actor WhisperrClient {
         ]
         pushReceivesInFlight.insert(payload.messageID)
         defer { pushReceivesInFlight.remove(payload.messageID) }
-        try await track("push_received", properties: withAutomaticProperties(properties))
+        try await record("push_received", properties: withAutomaticProperties(properties), origin: .automatic)
         receivedPushMessageIDs.append(payload.messageID)
         if receivedPushMessageIDs.count > Self.maxRememberedPushOpens {
             receivedPushMessageIDs.removeFirst(receivedPushMessageIDs.count - Self.maxRememberedPushOpens)
@@ -1113,6 +1485,13 @@ public actor WhisperrClient {
     /// on each move to the foreground.
     @discardableResult
     public func pushPermissionChanged(_ status: WhisperrPushPermissionStatus) async -> Bool {
+        await reportPushPermission(status, details: [:])
+    }
+
+    /// `details`: the notification settings (`alerts_enabled`, `lock_screen`,
+    /// `scheduled_summary`, `time_sensitive`) sent with the event.
+    @discardableResult
+    private func reportPushPermission(_ status: WhisperrPushPermissionStatus, details: [String: JSONValue]) async -> Bool {
         guard !closed else {
             return false
         }
@@ -1122,7 +1501,13 @@ public actor WhisperrClient {
         }
         let statusChanged = pushPermissionStatus != status.rawValue
         let pushUpdate = applyPushPermission(status)
-        guard lastPushPermission != status.rawValue else {
+        // A setting that changed (alerts, lock screen, ...) with the same
+        // status also sends, from the second read in this process on.
+        let detailsChanged = !details.isEmpty && lastPushPermissionDetails != nil && lastPushPermissionDetails != details
+        if !details.isEmpty {
+            lastPushPermissionDetails = details
+        }
+        guard lastPushPermission != status.rawValue || detailsChanged else {
             if let pushUpdate {
                 await enqueue(pushUpdate)
             } else if statusChanged {
@@ -1134,14 +1519,15 @@ public actor WhisperrClient {
         // Claim the new status before the first await, so a concurrent call
         // with the same status cannot send it twice.
         lastPushPermission = status.rawValue
-        var properties: [String: JSONValue] = ["status": .string(status.rawValue)]
+        var properties = details
+        properties["status"] = .string(status.rawValue)
         if let previous {
             properties["previous_status"] = .string(previous)
         }
         var sent = true
         do {
             // The enqueue persists the claimed status with the event.
-            try await track("push_permission_changed", properties: withAutomaticProperties(properties))
+            try await record("push_permission_changed", properties: withAutomaticProperties(properties), origin: .automatic)
         } catch {
             if lastPushPermission == status.rawValue {
                 lastPushPermission = previous
@@ -1219,7 +1605,7 @@ public actor WhisperrClient {
         guard !closed, let status = await pushPermissionProvider() else {
             return nil
         }
-        await pushPermissionChanged(status)
+        await reportPushPermission(status, details: await pushPermissionDetails())
         return status
     }
 
@@ -1238,7 +1624,7 @@ public actor WhisperrClient {
         guard let status = await pushAuthorizationRequester(provisional) else {
             return nil
         }
-        await pushPermissionChanged(status)
+        await reportPushPermission(status, details: await pushPermissionDetails())
         return status
     }
 
@@ -1336,6 +1722,8 @@ public actor WhisperrClient {
         }
         await start()
         await queueRestoreIdentify()
+        // A flush sends the waiting app_opened with what is known.
+        attributionOpID = nil
         if let flushTask {
             await flushTask.value
             return
@@ -1403,7 +1791,7 @@ public actor WhisperrClient {
         await start()
     }
 
-    private func enqueue(_ op: QueuedOperation) async {
+    private func enqueue(_ op: QueuedOperation, autoFlush: Bool = true) async {
         queue.append(op)
         if queue.count > options.maxQueueSize {
             let overflow = queue.count - options.maxQueueSize
@@ -1416,7 +1804,7 @@ public actor WhisperrClient {
             ))
         }
         await persist()
-        if queue.count >= options.flushAt {
+        if autoFlush, queue.count >= options.flushAt {
             Task { await self.flush() }
         }
     }

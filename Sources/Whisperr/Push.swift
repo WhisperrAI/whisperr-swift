@@ -202,6 +202,46 @@ enum WhisperrPushPermission {
         #endif
     }
 
+    /// The notification settings sent with `push_permission_changed`:
+    /// `alerts_enabled`, `lock_screen`, and on iOS 15 or later
+    /// `scheduled_summary` and `time_sensitive`. A setting the device does not
+    /// support is left out. Empty outside iOS and outside an app bundle.
+    static func currentDetails() async -> [String: JSONValue] {
+        #if os(iOS) && canImport(UserNotifications)
+        let path = Bundle.main.bundlePath
+        guard Bundle.main.bundleIdentifier != nil, path.hasSuffix(".app") || path.hasSuffix(".appex") else {
+            return [:]
+        }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<[String: JSONValue], Never>) in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                var out: [String: JSONValue] = [:]
+                out["alerts_enabled"] = detail(settings.alertSetting)
+                out["lock_screen"] = detail(settings.lockScreenSetting)
+                if #available(iOS 15.0, *) {
+                    out["scheduled_summary"] = detail(settings.scheduledDeliverySetting)
+                    out["time_sensitive"] = detail(settings.timeSensitiveSetting)
+                }
+                continuation.resume(returning: out)
+            }
+        }
+        #else
+        return [:]
+        #endif
+    }
+
+    #if os(iOS) && canImport(UserNotifications)
+    private static func detail(_ setting: UNNotificationSetting) -> JSONValue? {
+        switch setting {
+        case .enabled:
+            return .bool(true)
+        case .disabled:
+            return .bool(false)
+        default:
+            return nil
+        }
+    }
+    #endif
+
     /// Asks the user for notification permission (`.alert`, `.badge`,
     /// `.sound`, plus `.provisional` when `provisional` is true), then reads
     /// the permission. Returns nil where it cannot ask: without

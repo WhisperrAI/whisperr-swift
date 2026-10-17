@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.0
+
+- **Sessions.** Every event carries `context.session_id` (`sess_` and a UUID).
+  Each launch starts a new session, and so does the first event after 30
+  minutes without one. Before this, Swift apps reported no sessions.
+- **`app_backgrounded` counters:** `session_id`, `screen_count`,
+  `unique_screen_count`, `event_count` (your own `track()` events) and
+  `error_count` for the foreground visit that ends. `foreground_ms` now uses
+  the monotonic clock.
+- **Launch source.** `app_opened` carries `launch_source` (`push`,
+  `deep_link`, `universal_link`, `widget`, `shortcut`, `email` or `direct`),
+  with `whisperr_message_id`, a redacted `link_route`, `link_host` and `utm_*`
+  when they apply, and `first_after_update: true` on the first open after an
+  update. New: `handleOpenURL(_:)` and `handleUserActivity(_:)` report links.
+- **`app_error`.** New `trackError(_:screen:kind:)`, and uncaught Objective-C
+  exceptions through a chained `NSSetUncaughtExceptionHandler`. Type name and
+  fingerprint only, never the message. At most one per fingerprint and 20 per
+  session. `WhisperrOptions(captureErrors: false)` turns the automatic capture
+  off.
+- **`app_crashed`.** Sent at the next launch, before `app_opened`, when the app
+  ended in the foreground. Never in debug builds.
+- The privacy manifest adds Crash Data and Other Diagnostic Data.
+- These events need a Whisperr backend that knows `app_error` and
+  `app_crashed`.
+
 ## 0.6.0
 
 - **`emailOptedIn` on `identify()`.** Your user's email consent, sent as

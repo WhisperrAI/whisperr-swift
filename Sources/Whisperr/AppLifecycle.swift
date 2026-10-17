@@ -198,8 +198,25 @@ final class WhisperrLifecycleObserver: @unchecked Sendable {
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
-        ) { _ in
+        ) { [weak client] _ in
             WhisperrProcessActivity.shared.markActive()
+            client?.handleDidBecomeActive()
+        })
+        // The unclean-shutdown flag: a kill while inactive (app switcher) or
+        // a normal termination is not a crash.
+        tokens.append(center.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak client] _ in
+            client?.handleWillResignActive()
+        })
+        tokens.append(center.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak client] _ in
+            client?.handleWillTerminate()
         })
         tokens.append(center.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
