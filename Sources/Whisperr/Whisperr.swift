@@ -150,6 +150,33 @@ public enum Whisperr {
     }
     #endif
 
+    /// Reports a launch from a deep link or universal link, so that
+    /// `app_opened` carries its `launch_source`. Call it from
+    /// `application(_:open:options:)`, `scene(_:openURLContexts:)` or
+    /// SwiftUI `.onOpenURL`.
+    public static func handleOpenURL(_ url: URL) {
+        perform { await $0.recordLaunchURL(url) }
+    }
+
+    /// Reports a launch from a universal link. Call it from
+    /// `application(_:continue:restorationHandler:)`, `scene(_:continue:)` or
+    /// SwiftUI `.onContinueUserActivity(NSUserActivityTypeBrowsingWeb)`.
+    #if canImport(ObjectiveC)
+    public static func handleUserActivity(_ activity: NSUserActivity) {
+        guard activity.activityType == NSUserActivityTypeBrowsingWeb, let url = activity.webpageURL else {
+            return
+        }
+        handleOpenURL(url)
+    }
+    #endif
+
+    /// Reports an error your app handled as `app_error` (type name only,
+    /// never the message). See `WhisperrClient.trackError(_:screen:kind:)`.
+    public static func trackError(_ error: Error, screen: String? = nil, kind: WhisperrErrorKind = .handled) {
+        let name = WhisperrSignals.errorName(error)
+        perform { await $0.recordError(name: name, frames: [], kind: kind.rawValue, fatal: false, screen: screen) }
+    }
+
     /// Returns the deep link of the last Whisperr notification the user
     /// opened, and forgets it, so each link is handled once. Call it when your
     /// UI is ready (for example in `.onAppear` and when

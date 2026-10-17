@@ -9,7 +9,7 @@ stable event idempotency.
 Add the package in Xcode or Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.6.0")
+.package(url: "https://github.com/WhisperrAI/whisperr-swift.git", from: "0.7.0")
 ```
 
 ## Quick Start
@@ -61,8 +61,10 @@ with no extra code:
 | --- | --- | --- |
 | `app_installed` | — | first launch with the SDK |
 | `app_updated` | `previous_version`, `previous_build` | first launch after the app version or build changes |
-| `app_opened` | `cold_start` | the app comes to the foreground (`true` the first time in the process) |
-| `app_backgrounded` | `foreground_ms` | the app goes to the background |
+| `app_crashed` | `crash_kind`, `detected_by`, `crashed_app_version`, `crashed_session_id`, `crashed_screen_name`, `foreground` | at launch, when the last run ended while the app was in the foreground (see [Errors and crashes](#errors-and-crashes)) |
+| `app_opened` | `cold_start`, `launch_source`, `first_after_update` | the app comes to the foreground (`cold_start` is `true` the first time in the process; see [Launch source](#launch-source)) |
+| `app_backgrounded` | `foreground_ms`, `session_id`, `screen_count`, `unique_screen_count`, `event_count`, `error_count` | the app goes to the background, with the counts of this foreground visit |
+| `app_error` | `error_kind`, `fatal`, `error_name`, `fingerprint`, `screen_name`, `session_id` | an uncaught Objective-C exception, or a `trackError` call |
 | `push_permission_changed` | `status`, `previous_status` | the app comes to the foreground and the notification permission changed (see [Permission](#2-permission)) |
 
 Each one, and also `screen_viewed`, `push_opened` and `push_received`,
@@ -73,6 +75,43 @@ and iPad), `os_version`, `platform` (the OS family, `"ios"`), `sdk_name`
 Every event, also your own `track()` events, carries `app_version`,
 `app_build`, `platform`, `sdk_name` and `sdk_version` in `context`. A value
 the platform cannot provide is left out. A `context` key you pass wins.
+
+Every event also carries `context.session_id` (`sess_` and a UUID). Each app
+launch starts a new session, and so does the first event after 30 minutes
+without one. `app_backgrounded` repeats the id and counts what happened in
+the foreground visit that ends: `screen_viewed` events (`screen_count`), the
+distinct screen names (`unique_screen_count`), your own `track()` events
+(`event_count`) and `app_error` occurrences (`error_count`, including the ones
+the caps below drop). `foreground_ms` uses the monotonic clock, so a change of
+the device time does not affect it.
+
+### Launch source
+
+`app_opened` carries `launch_source`: what brought the user into the app.
+`push` when the user tapped a Whisperr notification (reported through
+`handleNotificationResponse`, with its `whisperr_message_id`), `deep_link`
+or `universal_link` for a link, `widget` or `shortcut` for a link with
+`wsrc=widget` or `wsrc=shortcut` in its query, `email` for a link with a
+`wmid` parameter, and `direct` otherwise. A push or link counts when it
+arrives within 1.5 seconds of the move to the foreground and before the next
+flush. Report links with one line:
+
+```swift
+// SwiftUI
+.onOpenURL { Whisperr.handleOpenURL($0) }
+.onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { Whisperr.handleUserActivity($0) }
+
+// UIKit: application(_:open:options:) / scene(_:openURLContexts:)
+Whisperr.handleOpenURL(url)
+// application(_:continue:restorationHandler:) / scene(_:continue:)
+Whisperr.handleUserActivity(userActivity)
+```
+
+For a link the SDK keeps only the path, with every segment that is all digits,
+a UUID, or 16 characters or longer replaced by `:id` (`link_route`), the host
+of an http(s) link (`link_host`) and `utm_source`, `utm_medium` and
+`utm_campaign`. It drops the rest of the query and the fragment. The first
+`app_opened` after `app_updated` also carries `first_after_update: true`.
 
 Install and update detection compare the app version with the one stored at
 the last launch, so they need persistence (on by default). After an upgrade
@@ -90,6 +129,37 @@ suspends the app. App extensions and macOS send no lifecycle events.
 ```swift
 try await whisperr.screen("Paywall")   // sends screen_viewed { screen_name: "Paywall" }
 ```
+
+The last screen name also goes on `app_error` and `app_crashed`.
+
+## Errors and crashes
+
+```swift
+do {
+    try await loadCart()
+} catch {
+    await whisperr.trackError(error)                                   // error_kind: handled
+    await whisperr.trackError(error, screen: "Checkout", kind: .network)
+}
+```
+
+`trackError` sends `app_error` with the error's type name (`CartLoadError`;
+for an `NSError`, its domain and code), never its message, stack or URL, and a
+`fingerprint` that groups identical errors. The SDK also reports uncaught
+Objective-C exceptions as `app_error` with `error_kind: native` and
+`fatal: true`. It installs its handler with `NSSetUncaughtExceptionHandler`
+and still calls the handler that was installed before it (for example a crash
+reporter). Swift runtime traps and signals are not caught. Turn the automatic
+capture off with `WhisperrOptions(captureErrors: false)`; `trackError` still
+works. At most one `app_error` per fingerprint and 20 per session are sent,
+and they never trigger a flush on their own.
+
+When the app ends while it is in the foreground (a crash, a watchdog kill, or
+running out of memory), the next launch sends `app_crashed` before its
+`app_opened`: `crash_kind: abnormal_exit`, `detected_by: unclean_shutdown`, or
+`crash_kind: crash`, `detected_by: native_exception` after an uncaught
+exception. Debug builds never send `app_crashed`, because stopping the app from
+the debugger looks the same.
 
 ## Identify
 
@@ -495,6 +565,7 @@ let whisperr = WhisperrClient(
         maxQueueSize: 1_000,
         maxRetries: 6,
         debug: false,
+        captureErrors: true,   // report uncaught exceptions as app_error
         onError: { error in
             print("whisperr:", error.type.rawValue, error.message)
         }
@@ -506,7 +577,9 @@ The default persistence uses `UserDefaults` and stores the pending queue, the
 identified user, the last-sent push token pair and its fields (kind, platform,
 APNs environment), the anonymous id, the opt-out choice, the last app version
 seen, the push message ids already reported as opened, and the last
-notification permission sent, so they survive app restarts. For tests or ephemeral runtimes, pass
+notification permission sent, so they survive app restarts. A separate
+`UserDefaults` key holds the running foreground visit (session id, screen,
+app version) for `app_crashed`. For tests or ephemeral runtimes, pass
 `InMemoryWhisperrPersistence()`.
 
 ## Opt-out
@@ -535,6 +608,9 @@ privacy report. It declares:
   Interaction (events, screens, app opens). Purposes: Analytics, Product
   Personalization, and Developer's Advertising or Marketing (retention
   messages).
+- Crash Data (`app_crashed`) and Other Diagnostic Data (`app_error`: error
+  type name and fingerprint), linked to the user, not used for tracking.
+  Purposes: Analytics and App Functionality.
 - Required-reason API: `UserDefaults`, reason `CA92.1` (the SDK reads and
   writes its own queue and settings, only inside your app).
 

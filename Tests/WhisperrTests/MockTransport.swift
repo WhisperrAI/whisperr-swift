@@ -150,7 +150,10 @@ func makeLifecycleClient(
     // push_permission_changed unless they opt in.
     pushPermission: @escaping @Sendable () async -> WhisperrPushPermissionStatus? = { nil },
     pushAuthorization: @escaping @Sendable (Bool) async -> WhisperrPushPermissionStatus? = { _ in nil },
-    restoreDebounceFires: Bool = false
+    restoreDebounceFires: Bool = false,
+    captureErrors: Bool = true,
+    runMarkers: WhisperrRunMarkerStore = .inMemory(),
+    isDebugBuild: Bool = false
 ) -> WhisperrClient {
     let ids = IDSequence()
     let anonIDs = IDSequence()
@@ -165,7 +168,8 @@ func makeLifecycleClient(
             maxRetryDelay: 0,
             enablePersistence: persistence != nil,
             automaticEvents: automaticEvents,
-            automaticPushPermission: automaticPushPermission
+            automaticPushPermission: automaticPushPermission,
+            captureErrors: captureErrors
         ),
         persistence: persistence,
         transport: transport,
@@ -177,7 +181,10 @@ func makeLifecycleClient(
         anonymousIDGenerator: { "anon-" + anonIDs.next() },
         installsLifecycleObserver: false,
         pushPermissionProvider: pushPermission,
-        pushAuthorizationRequester: pushAuthorization
+        pushAuthorizationRequester: pushAuthorization,
+        uptime: { clock.now.timeIntervalSince1970 },
+        runMarkers: runMarkers,
+        isDebugBuild: isDebugBuild
     )
 }
 

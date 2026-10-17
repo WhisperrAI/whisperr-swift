@@ -275,6 +275,10 @@ public struct WhisperrOptions: Sendable {
     /// On by default; it also needs `automaticEvents`. Calls to
     /// `pushPermissionChanged(_:)` always send.
     public var automaticPushPermission: Bool
+    /// Reports uncaught Objective-C exceptions (`NSSetUncaughtExceptionHandler`,
+    /// chained to any handler installed before the SDK) as `app_error`. On by
+    /// default. `trackError(_:screen:kind:)` works either way.
+    public var captureErrors: Bool
     public var onError: (@Sendable (WhisperrError) -> Void)?
 
     public init(
@@ -290,6 +294,7 @@ public struct WhisperrOptions: Sendable {
         debug: Bool = false,
         automaticEvents: Bool = true,
         automaticPushPermission: Bool = true,
+        captureErrors: Bool = true,
         onError: (@Sendable (WhisperrError) -> Void)? = nil
     ) {
         self.flushInterval = max(0, flushInterval)
@@ -304,6 +309,7 @@ public struct WhisperrOptions: Sendable {
         self.debug = debug
         self.automaticEvents = automaticEvents
         self.automaticPushPermission = automaticPushPermission
+        self.captureErrors = captureErrors
         self.onError = onError
     }
 }

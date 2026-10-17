@@ -688,8 +688,12 @@ final class EventContextTests: XCTestCase {
         try await client.trackPushOpened(WhisperrPushPayload(messageID: "m1"))
         await client.flush()
 
-        let contexts = await transport.sentEvents().compactMap { $0["context"]?.objectValue }
+        var contexts = await transport.sentEvents().compactMap { $0["context"]?.objectValue }
         XCTAssertEqual(contexts.count, 2)
+        // Signals v3: every event also carries the session id.
+        let session = try XCTUnwrap(contexts[0].removeValue(forKey: "session_id")?.stringValue)
+        XCTAssertTrue(session.hasPrefix("sess_"))
+        XCTAssertEqual(contexts[1]["session_id"], .string(session))
         XCTAssertEqual(contexts[0], [
             "app_version": "9.9.9", "app_build": "230", "platform": "ios",
             "sdk_name": "whisperr-swift", "sdk_version": .string(kWhisperrSdkVersion),
