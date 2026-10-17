@@ -294,6 +294,8 @@ final class WhisperrRunMarkerStore: @unchecked Sendable {
     private let defaults: UserDefaults?
     private let key: String
     private var memory: WhisperrRunMarker?
+    /// The marker set aside while the app is inactive (see `park()`).
+    private var parked: WhisperrRunMarker?
 
     init(defaults: UserDefaults?, key: String = "net.whisperr.sdk.run") {
         self.defaults = defaults
@@ -313,6 +315,31 @@ final class WhisperrRunMarkerStore: @unchecked Sendable {
     func save(_ marker: WhisperrRunMarker?) {
         lock.lock()
         defer { lock.unlock() }
+        parked = nil
+        write(marker)
+    }
+
+    /// The app became inactive: clear the stored marker and keep it in
+    /// memory, so a kill from the app switcher is not reported as a crash.
+    func park() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let marker = read() else {
+            return
+        }
+        parked = marker
+        write(nil)
+        defaults?.synchronize()
+    }
+
+    /// The app is active again: store the parked marker.
+    func unpark() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let marker = parked else {
+            return
+        }
+        parked = nil
         write(marker)
     }
 
@@ -320,11 +347,13 @@ final class WhisperrRunMarkerStore: @unchecked Sendable {
     func update(_ change: (inout WhisperrRunMarker) -> Void) {
         lock.lock()
         defer { lock.unlock() }
-        guard var marker = read() else {
-            return
+        if var marker = read() {
+            change(&marker)
+            write(marker)
+        } else if var marker = parked {
+            change(&marker)
+            parked = marker
         }
-        change(&marker)
-        write(marker)
     }
 
     func markFatal() {

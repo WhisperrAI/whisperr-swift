@@ -111,6 +111,16 @@ public actor WhisperrClient {
     private var attributionOpID: String?
     private var attributionDeadline: TimeInterval?
     private var attributionRank = 0
+    /// A push or link that arrived while no app_opened was waiting (the
+    /// launch was still running). The next app_opened takes it when it is
+    /// queued within `attributionWindow` of the signal.
+    private var pendingLaunch: (signal: WhisperrLaunchSignal, at: TimeInterval)?
+    /// Counts moves to the background, so an app_opened that finishes after
+    /// the app already left the foreground sets no run marker.
+    private var backgroundCount = 0
+    /// The notification settings last read in this process, so a change of a
+    /// setting alone also sends push_permission_changed.
+    private var lastPushPermissionDetails: [String: JSONValue]?
     /// Set when app_updated is sent; the next app_opened carries
     /// first_after_update.
     private var pendingFirstAfterUpdate = false
@@ -383,7 +393,7 @@ public actor WhisperrClient {
     /// `UIApplication` and inside app extensions.
     private func attachLifecycle() async {
         #if canImport(ObjectiveC)
-        if installsLifecycleObserver, options.captureErrors, !closed {
+        if installsLifecycleObserver, options.captureErrors, options.automaticEvents, !closed {
             WhisperrErrorCapture.shared.attach(self, runMarkers: runMarkers)
         }
         #endif
@@ -438,6 +448,7 @@ public actor WhisperrClient {
         guard !closed else {
             return
         }
+        backgroundCount += 1
         await start() // persisted state (seen version, user, opt-out) first
         let since = foregroundSince
         foregroundSince = nil
@@ -470,6 +481,7 @@ public actor WhisperrClient {
     /// `attributionWindow`, before the event leaves the queue, sets its
     /// launch source.
     private func appOpened() async {
+        let generation = backgroundCount
         foregroundSince = uptime()
         visit = WhisperrVisitCounters()
         let coldStart = !hasOpenedInProcess
@@ -488,7 +500,12 @@ public actor WhisperrClient {
                 attributionOpID = id
                 attributionDeadline = uptime() + Self.attributionWindow
                 attributionRank = WhisperrLaunchSource.direct.rank
+                await applyPendingLaunch()
             }
+        }
+        // The app went to the background while this open was queued.
+        guard backgroundCount == generation else {
+            return
         }
         runMarkers.save(WhisperrRunMarker(
             sessionID: sessionID,
@@ -498,14 +515,50 @@ public actor WhisperrClient {
         ))
     }
 
+    /// Gives the app_opened just queued the signal that arrived before it,
+    /// and moves that push's push_opened behind it.
+    private func applyPendingLaunch() async {
+        guard let pending = pendingLaunch else {
+            return
+        }
+        pendingLaunch = nil
+        guard uptime() - pending.at <= Self.attributionWindow else {
+            return
+        }
+        await resolveLaunch(pending.signal)
+        guard pending.signal.source == .push,
+              let messageID = pending.signal.properties["whisperr_message_id"],
+              let openedIndex = queue.firstIndex(where: { $0.id == attributionOpID }),
+              let pushIndex = queue.firstIndex(where: {
+                  $0.body["event_type"] == "push_opened"
+                      && $0.body["properties"]?.objectValue?["whisperr_message_id"] == messageID
+              }),
+              pushIndex < openedIndex else {
+            return
+        }
+        let pushOpened = queue.remove(at: pushIndex)
+        queue.insert(pushOpened, at: openedIndex)
+        await persist()
+    }
+
     /// Sets the launch source of the app_opened still waiting in the queue,
-    /// when `signal` outranks the one it has.
+    /// when `signal` outranks the one it has. With no app_opened waiting, the
+    /// signal is kept for the next one (see `pendingLaunch`).
     private func resolveLaunch(_ signal: WhisperrLaunchSignal) async {
+        let now = uptime()
         guard let id = attributionOpID,
               let deadline = attributionDeadline,
-              uptime() <= deadline,
-              signal.source.rank > attributionRank,
-              let index = queue.firstIndex(where: { $0.id == id }),
+              now <= deadline,
+              let index = queue.firstIndex(where: { $0.id == id }) else {
+            if let pending = pendingLaunch,
+               now - pending.at <= Self.attributionWindow,
+               pending.signal.source.rank >= signal.source.rank {
+                return
+            }
+            pendingLaunch = (signal, now)
+            return
+        }
+        guard signal.source.rank > attributionRank,
               case .object(var properties)? = queue[index].body["properties"] else {
             return
         }
@@ -551,6 +604,20 @@ public actor WhisperrClient {
         }
         await start()
         await resolveLaunch(signal)
+    }
+
+    /// The app stopped being active (app switcher, Control Center, a call):
+    /// a kill from here is not a crash. Synchronous, from the UIKit observer.
+    nonisolated func handleWillResignActive() {
+        runMarkers.park()
+    }
+
+    nonisolated func handleDidBecomeActive() {
+        runMarkers.unpark()
+    }
+
+    nonisolated func handleWillTerminate() {
+        runMarkers.save(nil)
     }
 
     /// Sends app_crashed when the last run ended in the foreground (the run
@@ -626,7 +693,7 @@ public actor WhisperrClient {
 
     /// An uncaught error from the exception handler.
     func handleUncaughtError(name: String, frames: [String], fatal: Bool) async {
-        guard options.captureErrors else {
+        guard options.captureErrors, options.automaticEvents else {
             return
         }
         if fatal {
@@ -1434,7 +1501,13 @@ public actor WhisperrClient {
         }
         let statusChanged = pushPermissionStatus != status.rawValue
         let pushUpdate = applyPushPermission(status)
-        guard lastPushPermission != status.rawValue else {
+        // A setting that changed (alerts, lock screen, ...) with the same
+        // status also sends, from the second read in this process on.
+        let detailsChanged = !details.isEmpty && lastPushPermissionDetails != nil && lastPushPermissionDetails != details
+        if !details.isEmpty {
+            lastPushPermissionDetails = details
+        }
+        guard lastPushPermission != status.rawValue || detailsChanged else {
             if let pushUpdate {
                 await enqueue(pushUpdate)
             } else if statusChanged {

@@ -232,6 +232,51 @@ final class SignalsTests: XCTestCase {
         XCTAssertNil(opened["utm_source"])
     }
 
+    func testAPushTapBeforeTheLaunchCompletesStillSetsLaunchSourcePush() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport)
+        // The notification response arrives while the launch is still running
+        // (before app_opened is queued).
+        let payload = try XCTUnwrap(WhisperrPushPayload(
+            userInfo: ["whisperr_message_id": "msg_early"],
+            actionID: nil,
+            coldStart: true
+        ))
+        _ = await client.handleNotification(payload)
+        await client.handleAppLaunch(inForeground: true)
+        await client.flush()
+
+        let events = await transport.sentEvents()
+        XCTAssertEqual(events.map { $0["event_type"] }, ["app_installed", "app_opened", "push_opened"])
+        XCTAssertEqual(properties(events[1])["launch_source"], "push")
+        XCTAssertEqual(properties(events[1])["whisperr_message_id"], "msg_early")
+    }
+
+    func testALinkBeforeTheLaunchCompletesStillSetsTheLaunchSource() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport)
+        await client.recordLaunchURL(URL(string: "myapp://home?wsrc=widget")!)
+        await client.handleAppLaunch(inForeground: true)
+        await client.flush()
+
+        let opened = await transport.sentEvents().first { $0["event_type"] == "app_opened" }.map(properties)
+        XCTAssertEqual(opened?["launch_source"], "widget")
+        XCTAssertEqual(opened?["link_route"], "/home")
+    }
+
+    func testAnOldSignalDoesNotAttributeALaterOpen() async throws {
+        let transport = MockTransport()
+        let clock = TestClock()
+        let client = makeLifecycleClient(transport: transport, clock: clock)
+        await client.recordLaunchURL(URL(string: "myapp://home")!)
+        clock.advance(2)
+        await client.handleAppLaunch(inForeground: true)
+        await client.flush()
+
+        let opened = await transport.sentEvents().first { $0["event_type"] == "app_opened" }.map(properties)
+        XCTAssertEqual(opened?["launch_source"], "direct")
+    }
+
     func testALinkAfterTheFlushNoLongerChangesTheOpen() async throws {
         let transport = MockTransport()
         let client = makeLifecycleClient(transport: transport)
@@ -304,6 +349,27 @@ final class SignalsTests: XCTestCase {
         // A status the app reports itself carries no settings.
         XCTAssertEqual(changes[1]["status"], "denied")
         XCTAssertNil(changes[1]["alerts_enabled"])
+    }
+
+    func testAChangedSettingAloneSendsPushPermissionChanged() async throws {
+        let transport = MockTransport()
+        let details = DetailsBox(["alerts_enabled": true, "lock_screen": true])
+        let client = makeLifecycleClient(
+            transport: transport,
+            pushPermission: { .authorized },
+            pushPermissionDetails: { details.value }
+        )
+        await client.refreshPushPermission()
+        await client.refreshPushPermission() // nothing changed
+        details.value = ["alerts_enabled": true, "lock_screen": false]
+        await client.refreshPushPermission()
+        await client.flush()
+
+        let changes = await transport.sentEvents().filter { $0["event_type"] == "push_permission_changed" }.map(properties)
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertEqual(changes[1]["status"], "authorized")
+        XCTAssertEqual(changes[1]["previous_status"], "authorized")
+        XCTAssertEqual(changes[1]["lock_screen"], false)
     }
 
     // MARK: - app_error
@@ -385,6 +451,17 @@ final class SignalsTests: XCTestCase {
         XCTAssertEqual(errors.last?["error_name"], "SyncError19")
         let backgrounded = events.first { $0["event_type"] == "app_backgrounded" }.map(properties)
         XCTAssertEqual(backgrounded?["error_count"], 22)
+    }
+
+    func testAutomaticEventsOffIgnoresUncaughtErrorsButNotTrackError() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport, automaticEvents: false)
+        await client.handleUncaughtError(name: "OffersRenderError", frames: [], fatal: true)
+        await client.trackError(CartLoadError())
+        await client.flush()
+
+        let errors = await transport.sentEvents().filter { $0["event_type"] == "app_error" }.map(properties)
+        XCTAssertEqual(errors.map { $0["error_name"] }, ["CartLoadError"])
     }
 
     func testCaptureErrorsOffIgnoresUncaughtErrorsButNotTrackError() async throws {
@@ -479,6 +556,47 @@ final class SignalsTests: XCTestCase {
         XCTAssertEqual(crashed?["detected_by"], "native_exception")
     }
 
+    func testAKillWhileInactiveOrATerminationIsNotACrash() async throws {
+        for ending in ["resignActive", "terminate"] {
+            let transport = MockTransport()
+            let persistence = InMemoryWhisperrPersistence()
+            let markers = WhisperrRunMarkerStore.inMemory()
+            let first = makeLifecycleClient(transport: transport, persistence: persistence, runMarkers: markers)
+            await first.handleAppLaunch(inForeground: true)
+            if ending == "resignActive" {
+                first.handleWillResignActive() // app switcher, then swiped away
+            } else {
+                first.handleWillTerminate()
+            }
+            await first.close()
+
+            let second = makeLifecycleClient(transport: transport, persistence: persistence, runMarkers: markers)
+            await second.handleAppLaunch(inForeground: true)
+            await second.flush()
+            let types = await transport.sentEvents().map { $0["event_type"] }
+            XCTAssertFalse(types.contains("app_crashed"), ending)
+        }
+    }
+
+    func testACrashAfterReturningFromInactiveIsStillReported() async throws {
+        let transport = MockTransport()
+        let persistence = InMemoryWhisperrPersistence()
+        let markers = WhisperrRunMarkerStore.inMemory()
+        let first = makeLifecycleClient(transport: transport, persistence: persistence, runMarkers: markers)
+        await first.handleAppLaunch(inForeground: true)
+        first.handleWillResignActive()
+        try await first.screen("Checkout")
+        first.handleDidBecomeActive()
+        await first.close()
+
+        let second = makeLifecycleClient(transport: transport, persistence: persistence, runMarkers: markers)
+        await second.handleAppLaunch(inForeground: true)
+        await second.flush()
+        let crashed = await transport.sentEvents().first { $0["event_type"] == "app_crashed" }.map(properties)
+        XCTAssertEqual(crashed?["crash_kind"], "abnormal_exit")
+        XCTAssertEqual(crashed?["crashed_screen_name"], "Checkout")
+    }
+
     func testABackgroundTerminationIsNotACrash() async throws {
         let transport = MockTransport()
         let persistence = InMemoryWhisperrPersistence()
@@ -550,5 +668,27 @@ final class PreviousHandlerProbe: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return count
+    }
+}
+
+final class DetailsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String: JSONValue]
+
+    init(_ value: [String: JSONValue]) {
+        stored = value
+    }
+
+    var value: [String: JSONValue] {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            stored = newValue
+        }
     }
 }
