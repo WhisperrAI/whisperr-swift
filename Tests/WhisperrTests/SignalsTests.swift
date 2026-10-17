@@ -74,6 +74,46 @@ final class SignalsTests: XCTestCase {
         XCTAssertNotEqual(sessions[1], sessions[2])
     }
 
+    func testTheSessionRollsWhenEitherClockShowsA30MinuteGap() async throws {
+        let transport = MockTransport()
+        let wall = TestClock()
+        let monotonic = TestClock()
+        let client = WhisperrClient(
+            apiKey: "wrk_test",
+            baseURL: URL(string: "https://api.test")!,
+            options: WhisperrOptions(flushInterval: 0, maxRetries: 0, automaticEvents: false),
+            persistence: InMemoryWhisperrPersistence(),
+            transport: transport,
+            clock: { wall.now },
+            idGenerator: { UUID().uuidString },
+            sleeper: { _ in },
+            deviceTraits: { [:] },
+            appEnvironment: { .fixture() },
+            anonymousIDGenerator: nil,
+            installsLifecycleObserver: false,
+            pushPermissionProvider: { nil },
+            uptime: { monotonic.now.timeIntervalSince1970 },
+            runMarkers: .inMemory(),
+            isDebugBuild: false
+        )
+        try await client.track("a")
+        // The device slept: the monotonic clock stood still.
+        wall.advance(31 * 60)
+        try await client.track("b")
+        // The wall clock was set back; the monotonic clock still ran.
+        wall.advance(-60 * 60)
+        monotonic.advance(31 * 60)
+        try await client.track("c")
+        try await client.track("d")
+        await client.flush()
+
+        let sessions = await transport.sentEvents().map(session)
+        XCTAssertEqual(sessions.count, 4)
+        XCTAssertNotEqual(sessions[0], sessions[1])
+        XCTAssertNotEqual(sessions[1], sessions[2])
+        XCTAssertEqual(sessions[2], sessions[3])
+    }
+
     func testVisitCountersResetOnEachForeground() async throws {
         let transport = MockTransport()
         let clock = TestClock()
@@ -237,6 +277,33 @@ final class SignalsTests: XCTestCase {
             "utm_source": "whisperr",
             "whisperr_message_id": "msg_e77"
         ])
+    }
+
+    // MARK: - push_permission_changed
+
+    func testAPermissionReadSendsTheNotificationSettings() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(
+            transport: transport,
+            pushPermission: { .authorized },
+            pushPermissionDetails: {
+                ["alerts_enabled": true, "lock_screen": false, "scheduled_summary": true, "time_sensitive": false]
+            }
+        )
+        await client.refreshPushPermission()
+        await client.pushPermissionChanged(.denied)
+        await client.flush()
+
+        let changes = await transport.sentEvents().filter { $0["event_type"] == "push_permission_changed" }.map(properties)
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertEqual(changes[0]["status"], "authorized")
+        XCTAssertEqual(changes[0]["alerts_enabled"], true)
+        XCTAssertEqual(changes[0]["lock_screen"], false)
+        XCTAssertEqual(changes[0]["scheduled_summary"], true)
+        XCTAssertEqual(changes[0]["time_sensitive"], false)
+        // A status the app reports itself carries no settings.
+        XCTAssertEqual(changes[1]["status"], "denied")
+        XCTAssertNil(changes[1]["alerts_enabled"])
     }
 
     // MARK: - app_error

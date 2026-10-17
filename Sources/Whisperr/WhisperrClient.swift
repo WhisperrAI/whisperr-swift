@@ -62,6 +62,8 @@ public actor WhisperrClient {
     private var pushPermissionStatus: String?
     private let pushPermissionProvider: @Sendable () async -> WhisperrPushPermissionStatus?
     private let pushAuthorizationRequester: @Sendable (Bool) async -> WhisperrPushPermissionStatus?
+    /// Reads the notification settings sent with push_permission_changed.
+    private let pushPermissionDetails: @Sendable () async -> [String: JSONValue]
     /// The keys every event carries in `context` (C5). Injectable so
     /// conformance runs can silence them.
     private let eventContext: @Sendable () -> [String: JSONValue]
@@ -96,6 +98,7 @@ public actor WhisperrClient {
     /// and after `sessionIdleTimeout` without an event. In memory only.
     private var sessionID: String?
     private var sessionLastEventAt: Date?
+    private var sessionLastEventUptime: TimeInterval?
     /// app_error dedupe and cap, per session.
     private var sessionErrorFingerprints: Set<String> = []
     private var sessionErrorsSent = 0
@@ -198,7 +201,8 @@ public actor WhisperrClient {
         logger: (@Sendable (String) -> Void)? = nil,
         uptime: (@Sendable () -> TimeInterval)? = nil,
         runMarkers: WhisperrRunMarkerStore? = nil,
-        isDebugBuild: Bool? = nil
+        isDebugBuild: Bool? = nil,
+        pushPermissionDetails: (@Sendable () async -> [String: JSONValue])? = nil
     ) {
         self.options = options
         self.logger = logger ?? { print($0) }
@@ -227,6 +231,7 @@ public actor WhisperrClient {
             await WhisperrPushPermission.request(provisional: provisional)
         }
         self.uptime = uptime ?? { ProcessInfo.processInfo.systemUptime }
+        self.pushPermissionDetails = pushPermissionDetails ?? { await WhisperrPushPermission.currentDetails() }
         // Without persistence a crash cannot be told at the next launch.
         let persists = options.enablePersistence || persistence != nil
         self.runMarkers = runMarkers ?? (persists ? WhisperrRunMarkerStore(defaults: .standard) : .inMemory())
@@ -578,17 +583,24 @@ public actor WhisperrClient {
     }
 
     /// The current session id, rolled after `sessionIdleTimeout` without an
-    /// event. Every call counts as an event.
+    /// event. Every call counts as an event. The gap is measured on both the
+    /// wall clock and the monotonic clock, and either one rolls the session:
+    /// `systemUptime` stops while the device sleeps, and the wall clock can
+    /// be set back.
     private func touchSession() -> String {
         let now = clock()
-        if let id = sessionID, let last = sessionLastEventAt,
-           now.timeIntervalSince(last) < Self.sessionIdleTimeout {
+        let nowUptime = uptime()
+        if let id = sessionID, let last = sessionLastEventAt, let lastUptime = sessionLastEventUptime,
+           now.timeIntervalSince(last) < Self.sessionIdleTimeout,
+           nowUptime - lastUptime < Self.sessionIdleTimeout {
             sessionLastEventAt = now
+            sessionLastEventUptime = nowUptime
             return id
         }
         let id = WhisperrSignals.newSessionID()
         sessionID = id
         sessionLastEventAt = now
+        sessionLastEventUptime = nowUptime
         sessionErrorFingerprints = []
         sessionErrorsSent = 0
         runMarkers.update { $0.sessionID = id }
@@ -1406,6 +1418,13 @@ public actor WhisperrClient {
     /// on each move to the foreground.
     @discardableResult
     public func pushPermissionChanged(_ status: WhisperrPushPermissionStatus) async -> Bool {
+        await reportPushPermission(status, details: [:])
+    }
+
+    /// `details`: the notification settings (`alerts_enabled`, `lock_screen`,
+    /// `scheduled_summary`, `time_sensitive`) sent with the event.
+    @discardableResult
+    private func reportPushPermission(_ status: WhisperrPushPermissionStatus, details: [String: JSONValue]) async -> Bool {
         guard !closed else {
             return false
         }
@@ -1427,7 +1446,8 @@ public actor WhisperrClient {
         // Claim the new status before the first await, so a concurrent call
         // with the same status cannot send it twice.
         lastPushPermission = status.rawValue
-        var properties: [String: JSONValue] = ["status": .string(status.rawValue)]
+        var properties = details
+        properties["status"] = .string(status.rawValue)
         if let previous {
             properties["previous_status"] = .string(previous)
         }
@@ -1512,7 +1532,7 @@ public actor WhisperrClient {
         guard !closed, let status = await pushPermissionProvider() else {
             return nil
         }
-        await pushPermissionChanged(status)
+        await reportPushPermission(status, details: await pushPermissionDetails())
         return status
     }
 
@@ -1531,7 +1551,7 @@ public actor WhisperrClient {
         guard let status = await pushAuthorizationRequester(provisional) else {
             return nil
         }
-        await pushPermissionChanged(status)
+        await reportPushPermission(status, details: await pushPermissionDetails())
         return status
     }
 

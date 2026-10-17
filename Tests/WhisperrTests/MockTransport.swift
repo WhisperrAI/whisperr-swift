@@ -153,7 +153,8 @@ func makeLifecycleClient(
     restoreDebounceFires: Bool = false,
     captureErrors: Bool = true,
     runMarkers: WhisperrRunMarkerStore = .inMemory(),
-    isDebugBuild: Bool = false
+    isDebugBuild: Bool = false,
+    pushPermissionDetails: @escaping @Sendable () async -> [String: JSONValue] = { [:] }
 ) -> WhisperrClient {
     let ids = IDSequence()
     let anonIDs = IDSequence()
@@ -184,7 +185,8 @@ func makeLifecycleClient(
         pushAuthorizationRequester: pushAuthorization,
         uptime: { clock.now.timeIntervalSince1970 },
         runMarkers: runMarkers,
-        isDebugBuild: isDebugBuild
+        isDebugBuild: isDebugBuild,
+        pushPermissionDetails: pushPermissionDetails
     )
 }
 
