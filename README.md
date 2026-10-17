@@ -24,9 +24,10 @@ try await whisperr.identify(
     email: "ada@example.com"
 )
 
+// Your app's core action. This event name is only an example.
 try await whisperr.track(
-    "checkout_completed",
-    properties: ["amount": 42, "currency": "USD"]
+    "report_exported",
+    properties: ["format": "pdf"]
 )
 
 await whisperr.flush()
@@ -146,6 +147,7 @@ Shortcut `phone` and `pushToken` values expand to opted-in channels. The
 `emailOptedIn` with your user's answer when you have it:
 
 ```swift
+// Only for a user who said yes when your app asked about email.
 try await whisperr.identify("user_123", email: "ada@example.com", emailOptedIn: true)
 ```
 
