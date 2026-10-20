@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **The notification permission reports itself.** With
+  `automaticPushPermission` (on by default) the SDK now also reads the
+  permission when the app becomes active again, so the answer to your own
+  `requestAuthorization` prompt is reported as soon as the prompt closes (the
+  prompt makes the app inactive without leaving the foreground). It also reads
+  it after `reset()`, so the next user on the device gets a report. Launch and
+  foreground reads stay; one read covers one activation.
+- **A status you report wins.** The automatic read sends
+  `push_permission_changed` only when the OS value (or one of its settings)
+  changed since the last OS reading, or when nothing was reported since
+  install or `reset()`. A status reported with `pushPermissionChanged(_:)`
+  stands until the OS value changes. The last OS reading is persisted
+  (`os_push_permission`); state from older versions still loads.
+- Nothing is read while the user is opted out.
+  `WhisperrOptions(automaticPushPermission: false)` (or
+  `automaticEvents: false`) still turns the automatic read off.
+
 ## 0.7.0
 
 - **Sessions.** Every event carries `context.session_id` (`sess_` and a UUID).

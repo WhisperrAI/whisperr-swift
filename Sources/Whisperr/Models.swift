@@ -270,10 +270,12 @@ public struct WhisperrOptions: Sendable {
     /// the background happens whatever this value is.
     public var automaticEvents: Bool
     /// Reads the notification permission (`getNotificationSettings`, no
-    /// prompt) on each move to the foreground and sends
-    /// `push_permission_changed` when it differs from the last value sent.
-    /// On by default; it also needs `automaticEvents`. Calls to
-    /// `pushPermissionChanged(_:)` always send.
+    /// prompt) at launch, on each move to the foreground, when the app becomes
+    /// active again (right after the permission prompt is answered) and after
+    /// `reset()`, and sends `push_permission_changed` when the OS value
+    /// changed. On by default; it also needs `automaticEvents`. A status you
+    /// report with `pushPermissionChanged(_:)` is sent when it differs from
+    /// the last one sent, and stands until the OS value changes.
     public var automaticPushPermission: Bool
     /// Reports uncaught Objective-C exceptions (`NSSetUncaughtExceptionHandler`,
     /// chained to any handler installed before the SDK) as `app_error`. On by
@@ -367,6 +369,8 @@ struct PersistedState: Codable, Equatable, Sendable {
     var appLanguage: String?
     var lastIdentify: IdentityRecord?
     var receivedPushMessageIDs: [String]?
+    /// The last notification permission read from the OS and reported (0.8.0).
+    var osPushPermission: String?
 
     var isEmpty: Bool {
         queue.isEmpty && userID == nil && lastPushUserID == nil && lastPushToken == nil
@@ -376,7 +380,7 @@ struct PersistedState: Codable, Equatable, Sendable {
             && pushPermission == nil && pushPermissionStatus == nil
             && lastPushAnonymousID == nil && lastPushClientAppID == nil && lastPushProviderProject == nil
             && lastPushSentAt == nil && appLanguage == nil && lastIdentify == nil
-            && (receivedPushMessageIDs ?? []).isEmpty
+            && (receivedPushMessageIDs ?? []).isEmpty && osPushPermission == nil
     }
 
     enum CodingKeys: String, CodingKey {
@@ -401,6 +405,7 @@ struct PersistedState: Codable, Equatable, Sendable {
         case appLanguage = "app_language"
         case lastIdentify = "last_identify"
         case receivedPushMessageIDs = "received_push_message_ids"
+        case osPushPermission = "os_push_permission"
     }
 }
 

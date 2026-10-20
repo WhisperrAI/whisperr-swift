@@ -200,7 +200,11 @@ final class WhisperrLifecycleObserver: @unchecked Sendable {
             queue: .main
         ) { [weak client] _ in
             WhisperrProcessActivity.shared.markActive()
-            client?.handleDidBecomeActive()
+            guard let client else { return }
+            client.handleDidBecomeActive()
+            // The permission prompt was answered, or the user is back from
+            // Notification Center: read the permission again.
+            Task { await client.handleBecameActive() }
         })
         // The unclean-shutdown flag: a kill while inactive (app switcher) or
         // a normal termination is not a crash.
