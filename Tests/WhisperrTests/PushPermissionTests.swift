@@ -301,7 +301,8 @@ final class PushPermissionTests: XCTestCase {
             return permission.get()
         })
         await client.handleAppLaunch(inForeground: true)
-        await client.optOut()
+        await client.flush()
+        await client.optOut() // drops what is still queued
         permission.set(.denied)
         await client.handleDidEnterBackground()
         await client.handleWillEnterForeground()
