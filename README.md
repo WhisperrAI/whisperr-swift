@@ -65,7 +65,7 @@ with no extra code:
 | `app_opened` | `cold_start`, `launch_source`, `first_after_update` | the app comes to the foreground (`cold_start` is `true` the first time in the process; see [Launch source](#launch-source)) |
 | `app_backgrounded` | `foreground_ms`, `session_id`, `screen_count`, `unique_screen_count`, `event_count`, `error_count` | the app goes to the background, with the counts of this foreground visit |
 | `app_error` | `error_kind`, `fatal`, `error_name`, `fingerprint`, `screen_name`, `session_id` | an uncaught Objective-C exception, or a `trackError` call |
-| `push_permission_changed` | `status`, `previous_status` | the app comes to the foreground and the notification permission changed (see [Permission](#2-permission)) |
+| `push_permission_changed` | `status`, `previous_status` | at launch, when the app comes to the foreground or becomes active again (after the permission prompt), and after `reset()`, when the notification permission changed (see [Permission](#2-permission)) |
 
 Each one, and also `screen_viewed`, `push_opened` and `push_received`,
 carries `app_version`, `app_build`, `os_name` (lowercase, `"ios"` on iPhone
@@ -331,20 +331,36 @@ let quiet = await Whisperr.requestPushAuthorization(provisional: true) // no pro
 
 Then call `registerForRemoteNotifications()` to get the token.
 
-By default the SDK also reads the status each time the app comes to the
-foreground. It uses `getNotificationSettings`, which never shows a prompt.
-After your own prompt, report the answer at once:
+You do not have to report the permission yourself. By default the SDK reads
+it with `getNotificationSettings`, which never shows a prompt:
+
+- at launch, when the app starts in the foreground;
+- each time the app comes to the foreground (the user may have changed it in
+  Settings);
+- each time the app becomes active again, so right after your own
+  `requestAuthorization` prompt is answered (the prompt makes the app inactive
+  for a moment) and after the user leaves Notification Center;
+- after `reset()`, so the next user on the device gets a report.
+
+It sends `push_permission_changed` only when the OS value changed.
+Provisional permission reports as `provisional`; App Clip ephemeral permission
+reports as `authorized`. Nothing is read while the user is opted out.
+
+You can still report a status yourself, for example when your app has its own
+notification switch: `Whisperr.pushPermissionChanged(.denied)`. Your status
+wins: the automatic read does not send again until the OS value itself
+changes. `Whisperr.refreshPushPermission()` reads and reports at once.
+
+Turn the automatic read off with
+`WhisperrOptions(automaticPushPermission: false)`. `automaticEvents: false`
+turns it off too. Then report the permission yourself after your prompt and
+on each launch:
 
 ```swift
 UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in
     Whisperr.refreshPushPermission()
 }
 ```
-
-You can also report a status yourself: `Whisperr.pushPermissionChanged(.denied)`.
-Turn the foreground read off with
-`WhisperrOptions(automaticPushPermission: false)`. `automaticEvents: false`
-turns it off too.
 
 ### 3. Opens and deep links
 
@@ -456,9 +472,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     ) -> Bool {
         Task { await Whisperr.initialize(apiKey: "wpk_...") }
         UNUserNotificationCenter.current().delegate = self
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in
-            Whisperr.refreshPushPermission()
-        }
+        // The SDK reports the answer on its own when the prompt closes.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
         application.registerForRemoteNotifications()
         return true
     }
@@ -576,8 +591,9 @@ let whisperr = WhisperrClient(
 The default persistence uses `UserDefaults` and stores the pending queue, the
 identified user, the last-sent push token pair and its fields (kind, platform,
 APNs environment), the anonymous id, the opt-out choice, the last app version
-seen, the push message ids already reported as opened, and the last
-notification permission sent, so they survive app restarts. A separate
+seen, the push message ids already reported as opened, the last
+notification permission sent and the last one read from the OS, so they
+survive app restarts. A separate
 `UserDefaults` key holds the running foreground visit (session id, screen,
 app version) for `app_crashed`. For tests or ephemeral runtimes, pass
 `InMemoryWhisperrPersistence()`.

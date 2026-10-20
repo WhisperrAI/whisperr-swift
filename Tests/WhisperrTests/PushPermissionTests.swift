@@ -25,6 +25,23 @@ final class PermissionBox: @unchecked Sendable {
     }
 }
 
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+    }
+}
+
 final class PushPermissionTests: XCTestCase {
     private func permissionEvents(_ transport: MockTransport) async -> [[String: JSONValue]] {
         await transport.sentEvents().filter { $0["event_type"] == "push_permission_changed" }
@@ -179,6 +196,138 @@ final class PushPermissionTests: XCTestCase {
         let last = await permissionEvents(transport).last?["properties"]?.objectValue ?? [:]
         XCTAssertEqual(last["status"], "authorized")
         XCTAssertEqual(last["previous_status"], "not_determined")
+    }
+
+    func testBecomingActiveAfterThePromptReadsThePermission() async throws {
+        let transport = MockTransport()
+        let permission = PermissionBox(.notDetermined)
+        let reads = Counter()
+        let client = makeLifecycleClient(transport: transport, pushPermission: {
+            reads.increment()
+            return permission.get()
+        })
+
+        await client.handleAppLaunch(inForeground: true)
+        await client.handleBecameActive() // the launch's didBecomeActive: already read
+        XCTAssertEqual(reads.value, 1)
+
+        // The app's own requestAuthorization prompt: resign active, then
+        // active again, with no willEnterForeground.
+        client.handleWillResignActive()
+        permission.set(.authorized)
+        client.handleDidBecomeActive()
+        await client.handleBecameActive()
+        await client.flush()
+
+        XCTAssertEqual(reads.value, 2)
+        let properties = await permissionEvents(transport).map { $0["properties"]?.objectValue ?? [:] }
+        XCTAssertEqual(properties.map { $0["status"] }, ["not_determined", "authorized"])
+        XCTAssertEqual(properties.last?["previous_status"], "not_determined")
+    }
+
+    func testOneReadPerForeground() async throws {
+        let transport = MockTransport()
+        let reads = Counter()
+        let client = makeLifecycleClient(transport: transport, pushPermission: {
+            reads.increment()
+            return .authorized
+        })
+        await client.handleAppLaunch(inForeground: true)
+        client.handleWillResignActive()
+        await client.handleDidEnterBackground()
+        await client.handleWillEnterForeground()
+        await client.handleBecameActive() // the same foreground
+        XCTAssertEqual(reads.value, 2)
+    }
+
+    func testAManualStatusStandsUntilTheOSValueChanges() async throws {
+        let transport = MockTransport()
+        let permission = PermissionBox(.authorized)
+        let client = makeLifecycleClient(transport: transport, pushPermission: { permission.get() })
+
+        await client.handleAppLaunch(inForeground: true) // authorized
+        // The app turns push off in its own settings screen.
+        await client.pushPermissionChanged(.denied)
+        await client.handleDidEnterBackground()
+        await client.handleWillEnterForeground() // OS still authorized: nothing
+        await client.handleDidEnterBackground()
+        permission.set(.provisional) // the OS value changed
+        await client.handleWillEnterForeground()
+        await client.flush()
+
+        let properties = await permissionEvents(transport).map { $0["properties"]?.objectValue ?? [:] }
+        XCTAssertEqual(properties.map { $0["status"] }, ["authorized", "denied", "provisional"])
+        XCTAssertEqual(properties.last?["previous_status"], "denied")
+    }
+
+    func testTheOSReadingSurvivesRestart() async throws {
+        let transport = MockTransport()
+        let persistence = InMemoryWhisperrPersistence()
+        let first = makeLifecycleClient(transport: transport, persistence: persistence, pushPermission: { .authorized })
+        await first.handleAppLaunch(inForeground: true)
+        await first.pushPermissionChanged(.denied)
+        await first.close()
+
+        let second = makeLifecycleClient(transport: transport, persistence: persistence, pushPermission: { .authorized })
+        await second.handleAppLaunch(inForeground: true)
+        await second.flush()
+
+        let statuses = await permissionEvents(transport).map { $0["properties"]?.objectValue?["status"] }
+        XCTAssertEqual(statuses, ["authorized", "denied"], "an unchanged OS value must not override the manual one")
+    }
+
+    func testResetReportsThePermissionForTheNextUser() async throws {
+        let transport = MockTransport()
+        let client = makeLifecycleClient(transport: transport, pushPermission: { .authorized })
+        try await client.identify("user_1")
+        await client.handleAppLaunch(inForeground: true)
+        await client.reset() // no move to the foreground needed
+        await client.flush()
+
+        let events = await permissionEvents(transport)
+        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events[0]["external_user_id"], "user_1")
+        XCTAssertNil(events[1]["external_user_id"], "sent under the new anonymous handle")
+        XCTAssertNotNil(events[1]["anonymous_id"])
+        XCTAssertNil(events[1]["properties"]?.objectValue?["previous_status"])
+    }
+
+    func testOptedOutSkipsTheAutomaticRead() async throws {
+        let transport = MockTransport()
+        let permission = PermissionBox(.authorized)
+        let reads = Counter()
+        let client = makeLifecycleClient(transport: transport, pushPermission: {
+            reads.increment()
+            return permission.get()
+        })
+        await client.handleAppLaunch(inForeground: true)
+        await client.optOut()
+        permission.set(.denied)
+        await client.handleDidEnterBackground()
+        await client.handleWillEnterForeground()
+        XCTAssertEqual(reads.value, 1, "no read while opted out")
+
+        await client.optIn()
+        client.handleWillResignActive()
+        await client.handleBecameActive()
+        await client.flush()
+
+        let statuses = await permissionEvents(transport).map { $0["properties"]?.objectValue?["status"] }
+        XCTAssertEqual(statuses, ["authorized", "denied"])
+    }
+
+    func testTheSwitchStopsTheReadWhenBecomingActive() async throws {
+        let transport = MockTransport()
+        let reads = Counter()
+        let client = makeLifecycleClient(transport: transport, automaticPushPermission: false, pushPermission: {
+            reads.increment()
+            return .denied
+        })
+        await client.handleAppLaunch(inForeground: true)
+        client.handleWillResignActive()
+        await client.handleBecameActive()
+        await client.reset()
+        XCTAssertEqual(reads.value, 0)
     }
 
     func testBackgroundLaunchDoesNotReadThePermission() async throws {

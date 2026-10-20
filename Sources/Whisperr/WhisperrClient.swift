@@ -121,6 +121,19 @@ public actor WhisperrClient {
     /// The notification settings last read in this process, so a change of a
     /// setting alone also sends push_permission_changed.
     private var lastPushPermissionDetails: [String: JSONValue]?
+    /// The last notification permission the SDK read from the OS (the
+    /// automatic read, `refreshPushPermission()`, `requestPushAuthorization`)
+    /// and reported. Persisted and kept across reset(): the permission is the
+    /// device's. The automatic read reports only when the OS value differs
+    /// from it, so a status the app reported with `pushPermissionChanged(_:)`
+    /// stands until the OS setting actually changes.
+    private var lastOSPushPermission: String?
+    /// Counts moves away from the active state (willResignActive, background).
+    private let resignations = WhisperrResignationCounter()
+    /// `resignations` when the last automatic read started: launch,
+    /// willEnterForeground and didBecomeActive can all fire for one foreground,
+    /// and one read covers them.
+    private var resignationsAtLastRead: Int?
     /// Set when app_updated is sent; the next app_opened carries
     /// first_after_update.
     private var pendingFirstAfterUpdate = false
@@ -441,6 +454,18 @@ public actor WhisperrClient {
         await refreshPushPermissionIfAutomatic()
     }
 
+    /// The app became active. The system permission prompt (the app's own
+    /// `requestAuthorization` or the SDK's) and Notification Center make the
+    /// app resign active and come back without willEnterForeground, so the
+    /// permission is read here too: right after the prompt is answered. It
+    /// reads only when the app was inactive since the last read.
+    func handleBecameActive() async {
+        guard !closed else {
+            return
+        }
+        await refreshPushPermissionIfAutomatic()
+    }
+
     /// Sends app_backgrounded (with the length of the foreground period) and
     /// flushes, so the last events of a session leave the device before iOS
     /// suspends the app.
@@ -449,6 +474,7 @@ public actor WhisperrClient {
             return
         }
         backgroundCount += 1
+        resignations.increment()
         await start() // persisted state (seen version, user, opt-out) first
         let since = foregroundSince
         foregroundSince = nil
@@ -609,6 +635,7 @@ public actor WhisperrClient {
     /// The app stopped being active (app switcher, Control Center, a call):
     /// a kill from here is not a crash. Synchronous, from the UIKit observer.
     nonisolated func handleWillResignActive() {
+        resignations.increment()
         runMarkers.park()
     }
 
@@ -1480,9 +1507,10 @@ public actor WhisperrClient {
     /// server stops sending push to this device. `authorized` or
     /// `provisional` opts the held token back in.
     ///
-    /// Call it after `requestAuthorization`, or leave it to the SDK: with
-    /// `automaticPushPermission` (on by default) the SDK reads the permission
-    /// on each move to the foreground.
+    /// You rarely need it: with `automaticPushPermission` (on by default) the
+    /// SDK reads the permission at launch, on each move to the foreground and
+    /// right after the permission prompt is answered. A status reported here
+    /// wins over the automatic read until the OS value changes.
     @discardableResult
     public func pushPermissionChanged(_ status: WhisperrPushPermissionStatus) async -> Bool {
         await reportPushPermission(status, details: [:])
@@ -1606,6 +1634,7 @@ public actor WhisperrClient {
             return nil
         }
         await reportPushPermission(status, details: await pushPermissionDetails())
+        await noteOSPushPermission(status)
         return status
     }
 
@@ -1625,14 +1654,53 @@ public actor WhisperrClient {
             return nil
         }
         await reportPushPermission(status, details: await pushPermissionDetails())
+        await noteOSPushPermission(status)
         return status
     }
 
+    /// The automatic read (launch, foreground, didBecomeActive, reset). It
+    /// reports when the OS permission (or one of its settings) differs from
+    /// the last OS reading, or when nothing was reported since install or
+    /// reset(). A status reported with `pushPermissionChanged(_:)` stands until
+    /// the OS value changes. Nothing is read while opted out.
     private func refreshPushPermissionIfAutomatic() async {
-        guard options.automaticEvents, options.automaticPushPermission else {
+        guard !closed, options.automaticEvents, options.automaticPushPermission else {
             return
         }
-        await refreshPushPermission()
+        await start()
+        // Claimed after the last await, so concurrent triggers read once.
+        let activation = resignations.value
+        guard !optedOut, resignationsAtLastRead != activation else {
+            return
+        }
+        resignationsAtLastRead = activation
+        guard let status = await pushPermissionProvider() else {
+            return
+        }
+        let details = await pushPermissionDetails()
+        guard !closed, !optedOut else {
+            return
+        }
+        let statusChanged = lastOSPushPermission != status.rawValue
+        let detailsChanged = !details.isEmpty && lastPushPermissionDetails != nil && lastPushPermissionDetails != details
+        guard statusChanged || detailsChanged || lastPushPermission == nil else {
+            if !details.isEmpty {
+                lastPushPermissionDetails = details
+            }
+            return
+        }
+        await reportPushPermission(status, details: details)
+        await noteOSPushPermission(status)
+    }
+
+    /// Stores an OS reading once it is the reported status. A report that
+    /// could not be queued leaves the cache, so the next read tries again.
+    private func noteOSPushPermission(_ status: WhisperrPushPermissionStatus) async {
+        guard !optedOut, lastPushPermission == status.rawValue, lastOSPushPermission != status.rawValue else {
+            return
+        }
+        lastOSPushPermission = status.rawValue
+        await persist()
     }
 
     /// Clears the current user (e.g. on logout) after flushing pending work,
@@ -1666,8 +1734,10 @@ public actor WhisperrClient {
             pendingPush = nil
         }
         forgetPushPair()
-        // The next user on this device gets a fresh permission report.
+        // The next user on this device gets a fresh permission report: the
+        // automatic read below sends it under the new anonymous handle.
         lastPushPermission = nil
+        resignationsAtLastRead = nil
         lastIdentify = nil
         // A new handle; without a token to move it is created on first use.
         anonymousID = nil
@@ -1682,11 +1752,13 @@ public actor WhisperrClient {
         }
         guard !moved.isEmpty else {
             await persist()
+            await refreshPushPermissionIfAutomatic()
             return
         }
         for op in moved {
             await enqueue(op)
         }
+        await refreshPushPermissionIfAutomatic()
         Task { await self.flush() }
     }
 
@@ -1921,6 +1993,9 @@ public actor WhisperrClient {
         if pushPermissionStatus == nil {
             pushPermissionStatus = state.pushPermissionStatus
         }
+        if lastOSPushPermission == nil {
+            lastOSPushPermission = state.osPushPermission
+        }
         if anonymousID == nil {
             anonymousID = state.anonymousID
         }
@@ -1972,7 +2047,8 @@ public actor WhisperrClient {
             lastPushSentAt: lastPushSentAt?.timeIntervalSince1970,
             appLanguage: appLanguage,
             lastIdentify: lastIdentify,
-            receivedPushMessageIDs: receivedPushMessageIDs.isEmpty ? nil : receivedPushMessageIDs
+            receivedPushMessageIDs: receivedPushMessageIDs.isEmpty ? nil : receivedPushMessageIDs,
+            osPushPermission: lastOSPushPermission
         )
         do {
             let data = state.isEmpty ? nil : try JSONEncoder.whisperr.encode(state)
@@ -2186,5 +2262,24 @@ private extension QueuedOperation {
             kind: .identify,
             body: [subjectKey: subject, "channels": .array(retired)]
         )
+    }
+}
+
+/// Counts moves away from the active state. Bumped synchronously from the
+/// UIKit observer, read on the actor.
+final class WhisperrResignationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        defer { lock.unlock() }
+        count &+= 1
     }
 }

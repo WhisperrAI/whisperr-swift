@@ -88,9 +88,10 @@ public enum Whisperr {
         await storage.get()?.requestPushAuthorization(provisional: provisional)
     }
 
-    /// Reads the notification permission (no prompt) and reports it. Call it
-    /// after `requestAuthorization` completes. The SDK also does this on each
-    /// move to the foreground unless `automaticPushPermission` is off.
+    /// Reads the notification permission (no prompt) and reports it. With
+    /// `automaticPushPermission` (on by default) the SDK already does this at
+    /// launch, on each move to the foreground and right after your
+    /// `requestAuthorization` prompt is answered, so you rarely need it.
     public static func refreshPushPermission() {
         perform { await $0.refreshPushPermission() }
     }
