@@ -54,7 +54,7 @@ public actor WhisperrClient {
     private var receivedPushMessageIDs: [String] = []
     private var pushReceivesInFlight: Set<String> = []
     /// The last notification permission sent as push_permission_changed.
-    /// Persisted; reset() clears it.
+    /// Persisted; reset() after a user clears it.
     private var lastPushPermission: String?
     /// The last notification permission reported on this device, sent or
     /// not. While it is denied, push tokens are held in `pendingPush`.
@@ -69,7 +69,8 @@ public actor WhisperrClient {
     private let eventContext: @Sendable () -> [String: JSONValue]
     /// The device's anonymous handle (whisperr-spec SPEC.md → Anonymous
     /// visitors). Created on first use by a track before identify, carried by
-    /// the next identify (which promotes it), rotated by reset(). Persisted.
+    /// the next identify (which promotes it), rotated by reset() after a
+    /// user. Persisted.
     private var anonymousID: String?
     /// Global opt-out: while true nothing is queued or sent. Persisted, and
     /// kept across reset().
@@ -1643,8 +1644,21 @@ public actor WhisperrClient {
     /// handle: one identify opts it out under the old user, and an anonymous
     /// identify opts it in under the new handle, so the device stays
     /// reachable without reaching the old user. The app language is kept.
+    ///
+    /// Without a current user it does nothing: the device is still the same
+    /// anonymous visitor, so the anonymous handle, the sent push permission
+    /// and the push token stay (whisperr-spec SPEC.md → Anonymous visitors).
+    /// Safe to call on every signed-out state.
     public func reset() async {
+        // start() awaits the restore, so a user stored by an earlier launch is
+        // known here and still gets logged out.
         await start()
+        // Nobody to log out. Rotating here would mint a new anonymous user per
+        // call, each with a fresh push_permission_changed, and identify()
+        // promotes only the last handle, so the others would stay orphaned.
+        guard currentUserID != nil else {
+            return
+        }
         pendingRestoreUserID = nil
         await flush()
         var moved: [QueuedOperation] = []

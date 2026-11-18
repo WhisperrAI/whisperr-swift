@@ -49,8 +49,10 @@ call `close()` when tearing the client down for good.
 (a UUID, stored with the queue) and sends the event under it right away. The
 next `identify()` carries the same `anonymous_id`, so the server moves those
 events to the user. Events still in the queue go out under the user.
-`reset()` rotates the handle, so the next person on the device starts as a new
-anonymous visitor.
+`reset()` after a user rotates the handle, so the next person on the device
+starts as a new anonymous visitor. `reset()` with no user does nothing (the
+handle, the sent push permission and the push token stay), so it is safe to
+call on every signed-out state.
 
 ## Automatic events
 

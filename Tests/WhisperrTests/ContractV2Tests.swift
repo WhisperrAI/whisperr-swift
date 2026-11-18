@@ -387,6 +387,24 @@ final class AnonymousPushTokenTests: XCTestCase {
         XCTAssertEqual(after, bodies.count)
     }
 
+    func testResetWithoutAUserKeepsTheAnonymousToken() async throws {
+        let transport = MockTransport()
+        let handles = IDSequence()
+        let client = makeClient(transport: transport, anonymousIDGenerator: { "anon-" + handles.next() })
+        try await client.setPushToken("fcm_tok_a")
+        await client.flush()
+        await client.reset()
+        try await client.identify("user_1")
+        await client.flush()
+
+        // No opt-out and no new handle: identify promotes the one handle.
+        let bodies = await identifies(transport)
+        XCTAssertEqual(bodies, [
+            ["anonymous_id": "anon-mid-1", "channels": [["channel": "push", "address": "fcm_tok_a", "opted_in": true]]],
+            ["external_user_id": "user_1", "anonymous_id": "anon-mid-1", "channels": [["channel": "push", "address": "fcm_tok_a", "opted_in": true]]]
+        ])
+    }
+
     func testResetWithoutATokenSendsNothing() async throws {
         let transport = MockTransport()
         let client = makeClient(transport: transport)
