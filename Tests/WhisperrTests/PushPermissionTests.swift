@@ -102,6 +102,69 @@ final class PushPermissionTests: XCTestCase {
         XCTAssertNil(events[1]["properties"]?.objectValue?["previous_status"])
     }
 
+    func testResetWithoutAUserKeepsTheHandleAndTheSentStatus() async throws {
+        // An app that calls reset() on every signed-out state and reports the
+        // permission after it: before the fix every call minted a handle and a
+        // fresh report, and identify() promoted only the last one.
+        let transport = MockTransport()
+        let handles = IDSequence()
+        let client = makeClient(transport: transport, anonymousIDGenerator: { "anon-" + handles.next() })
+        for _ in 0..<3 {
+            await client.pushPermissionChanged(.denied)
+            await client.flush()
+            await client.reset()
+        }
+        try await client.identify("user_1")
+        await client.flush()
+
+        let events = await permissionEvents(transport)
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0]["anonymous_id"], "anon-mid-1")
+        let identifies = await transport.requests.filter { $0.path == "/v1/identify" }.map(\.body)
+        XCTAssertEqual(identifies, [.object(["external_user_id": "user_1", "anonymous_id": "anon-mid-1"])])
+    }
+
+    func testResetAfterIdentifyRotatesOnceAndASecondResetKeepsTheHandle() async throws {
+        let transport = MockTransport()
+        let handles = IDSequence()
+        let client = makeClient(transport: transport, anonymousIDGenerator: { "anon-" + handles.next() })
+        try await client.track("app_used")
+        await client.flush()
+        try await client.identify("user_1")
+        await client.reset()
+        try await client.track("app_used")
+        await client.flush()
+        await client.reset()
+        try await client.track("app_used")
+        try await client.identify("user_2")
+        await client.flush()
+
+        let subjects = await transport.sentEvents().map { $0["anonymous_id"] ?? $0["external_user_id"] }
+        XCTAssertEqual(subjects, ["anon-mid-1", "anon-mid-2", "user_2"])
+        let identifies = await transport.requests.filter { $0.path == "/v1/identify" }.map(\.body)
+        XCTAssertEqual(identifies, [
+            .object(["external_user_id": "user_1", "anonymous_id": "anon-mid-1"]),
+            .object(["external_user_id": "user_2", "anonymous_id": "anon-mid-2"])
+        ])
+    }
+
+    func testResetBeforeTheRestoreFinishesStillLogsOutTheStoredUser() async throws {
+        let stored = PersistedState(userID: "user_1", anonymousID: "anon-old")
+        let persistence = SlowLoadPersistence(data: try JSONEncoder.whisperr.encode(stored))
+        let transport = MockTransport()
+        let client = makeClient(transport: transport, persistence: persistence, anonymousIDGenerator: { "anon-new" })
+
+        async let started: Void = client.start()
+        await client.reset() // while the stored state is still loading
+        await started
+        try await client.track("app_used")
+        await client.flush()
+
+        let last = await transport.sentEvents().last
+        XCTAssertNil(last?["external_user_id"])
+        XCTAssertEqual(last?["anonymous_id"], "anon-new")
+    }
+
     func testDeniedHoldsTokensAcrossResetUntilThePermissionReturns() async throws {
         let transport = MockTransport()
         let client = makeClient(transport: transport)
@@ -336,5 +399,24 @@ final class NotificationHandlingTests: XCTestCase {
         _ = Whisperr.consumePendingDeepLink()
         XCTAssertNil(Whisperr.handleNotification(userInfo: ["deep_link": "myapp://news"]))
         XCTAssertNil(Whisperr.consumePendingDeepLink())
+    }
+}
+
+/// Persistence whose load takes a moment, so a call can arrive while the
+/// stored state is still loading.
+actor SlowLoadPersistence: WhisperrPersistence {
+    private var data: Data?
+
+    init(data: Data?) {
+        self.data = data
+    }
+
+    func load() async -> Data? {
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        return data
+    }
+
+    func save(_ data: Data?) async {
+        self.data = data
     }
 }

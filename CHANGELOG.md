@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **`reset()` with no user does nothing.** Before, it rotated the anonymous
+  id and forgot the sent push permission and token even when nobody was
+  signed in. An app that called `reset()` on every signed-out state and then
+  reported the permission minted a new anonymous user per call, each with a
+  fresh `push_permission_changed`, and `identify()` promoted only the last
+  one. Now the handle, the permission and the token stay until a user signs
+  in; `reset()` after a sign-in logs out as before.
+
 ## 0.7.0
 
 - **Sessions.** Every event carries `context.session_id` (`sess_` and a UUID).

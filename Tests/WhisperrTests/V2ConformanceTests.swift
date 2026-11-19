@@ -28,7 +28,7 @@ struct V2ExpectedRequest: Decodable {
 
 /// The contract v2 sections this SDK implements. `serverVersionContext` is for
 /// server SDKs only.
-let kImplementedV2Sections = ["restoreIdentify", "appLanguage", "anonymousPush", "pushRegistration", "versionContext"]
+let kImplementedV2Sections = ["restoreIdentify", "appLanguage", "anonymousPush", "anonymousReset", "pushRegistration", "versionContext"]
 
 func loadV2Spec() throws -> V2Spec {
     try loadSpec(fileName: "v2.json", envKey: "WHISPERR_V2_SPEC_PATH")
@@ -150,8 +150,8 @@ func assertGovernedContext(
 // MARK: - Runner
 
 /// Executes whisperr-spec conformance/v2.json: the contract v2 sections this
-/// SDK implements (restore identify, app_language, anonymous push, push
-/// registration, version context).
+/// SDK implements (restore identify, app_language, anonymous push, anonymous
+/// reset, push registration, version context).
 final class V2ConformanceTests: XCTestCase {
     func testRestoreIdentifySection() async throws {
         try await runSection("restoreIdentify")
@@ -163,6 +163,10 @@ final class V2ConformanceTests: XCTestCase {
 
     func testAnonymousPushSection() async throws {
         try await runSection("anonymousPush")
+    }
+
+    func testAnonymousResetSection() async throws {
+        try await runSection("anonymousReset")
     }
 
     func testPushRegistrationSection() async throws {
@@ -184,7 +188,9 @@ final class V2ConformanceTests: XCTestCase {
         let section = try XCTUnwrap(spec.sections[name], "v2.json has no \(name) section")
         XCTAssertTrue(section.appliesTo.contains("mobile"), name)
         XCTAssertFalse(section.cases.isEmpty, name)
-        for testCase in section.cases {
+        // A later section may supersede a case of an earlier one.
+        let superseded = supersededCases(in: "v2.json")
+        for testCase in section.cases where !superseded.contains(testCase.name) {
             try await run(testCase, label: "\(name).\(testCase.name)")
         }
     }
